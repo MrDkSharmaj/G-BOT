@@ -7,8 +7,10 @@
    • Force Join (Private Channel Join-Request auto detect + auto approve)
    • Unlimited Force-Join Channels (add / remove from Admin Panel)
    • First Bonus Claim  →  then 1 Reward per N Referrals
-   • Reward Code Vault (add 5-6 codes, har user ko ek-ek alag code)
+   • Agent Number Pool (unique / shared / cyclic distribution)
+   • WhatsApp "Contact Now" button on every Agent Number
    • Custom Buttons on Reward Message (Admin Panel se set)
+   • DB Backup + DB Restore (.db upload) • Broadcast with URL button
    • Referral Tracking (unique link:  t.me/bot?start=USERID)
    • Full Admin Panel : Stats • Rewards • Channels • Settings •
      Users Manage (block/unblock/gift/refs) • Broadcast • Leaderboard •
@@ -19,7 +21,9 @@
 """
 
 import os
+import re
 import io
+import shutil
 import csv
 import html
 import json
@@ -115,21 +119,29 @@ DEFAULT_SETTINGS = {
     "force_join": "1",
     "auto_approve": "1",
     "maintenance": "0",
-    "reward_mode": "unique",          # unique | shared
+    "reward_mode": "unique",          # unique | shared | cyclic
     "leave_penalty": "1",             # channel chhoda to dobara verify
     "notify_referrer": "1",
     "log_channel": "",
     "start_photo": "",
     "welcome_text": (
-        "👋 <b>Wᴇʟᴄᴏᴍᴇ {name}!</b>\n\n"
-        "🎁 Yahan aapko <b>exclusive reward codes</b> milte hain.\n"
-        "🔑 Pehla reward <b>FREE Bonus</b> hai — bas claim kijiye.\n"
-        "👥 Uske baad har <b>{per} referral</b> par ek naya reward.\n\n"
-        "Niche button se shuru kijiye 👇"
+        "🌟 <b>Wᴇʟᴄᴏᴍᴇ ᴛᴏ Gᴏᴏɢʟᴇ Mᴀᴘ Rᴀᴛɪɴɢ Rᴇᴠɪᴇᴡ Aɢᴇɴᴛ Nᴜᴍʙᴇʀs Bᴏᴛ!</b> 🗺️\n\n"
+        "📲 Yahan aapko milega ek dedicated <b>Google Map Rating Agent</b> ka WhatsApp number.\n\n"
+        "🔑 Pehla number <b>FREE</b> hai — bas claim karo!\n"
+        "👥 Har <b>{per} referral</b> pe ek naya <b>Agent Number</b> milega.\n"
+        "📞 Number milne ke baad seedha WhatsApp pe contact karo aur task lo!\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👥 Rᴇғᴇʀʀᴀʟs : <b>{refs}</b>\n"
+        "📱 Nᴜᴍʙᴇʀs Cʟᴀɪᴍᴇᴅ : <b>{claims}</b>\n"
+        "📦 Sᴛᴏᴄᴋ Lᴇғᴛ : <b>{stock}</b>\n"
+        "🎯 Nᴇxᴛ Nᴜᴍʙᴇʀ : <b>{next}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Niche se shuru karo 👇\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Bᴏᴛ ʙʏ</i> <b>{dev}</b>"
     ),
     "reward_text": (
-        "🎉 <b>Cᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴs {name}!</b>\n\n"
-        "Aapka reward unlock ho gaya hai 👇"
+        "🎉 <b>Cᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴs {name}!</b> 🎉"
     ),
     "reward_buttons": "[]",
     "gate_text": (
@@ -138,10 +150,10 @@ DEFAULT_SETTINGS = {
         "phir <b>✅ Vᴇʀɪғɪᴇᴅ</b> button dabaiye."
     ),
     "outofstock_text": (
-        "😔 <b>Rewards ᴏᴜᴛ ᴏғ sᴛᴏᴄᴋ!</b>\n\n"
-        "Filhaal saare rewards claim ho chuke hain. Admin naye rewards add karega "
-        "to bot aapko <b>automatically notify</b> kar dega. Aapka number "
-        "waiting list me safe hai ✅"
+        "😔 <b>Aɢᴇɴᴛ Nᴜᴍʙᴇʀs ᴏᴜᴛ ᴏғ sᴛᴏᴄᴋ!</b>\n\n"
+        "Filhaal saare agent numbers claim ho chuke hain. Admin naye numbers add karega "
+        "to bot aapko <b>automatically notify</b> kar dega. Aap waiting list me "
+        "safe hain ✅"
     ),
 }
 
@@ -204,6 +216,16 @@ def db_init():
         )""")
     for k, v in DEFAULT_SETTINGS.items():
         q("INSERT OR IGNORE INTO settings(key,val) VALUES(?,?)", (k, v))
+    # v2 migration: agar DB me purane default texts pade hain to naye texts laga do
+    legacy = {
+        "welcome_text": "exclusive reward codes",
+        "reward_text": "Aapka reward unlock ho gaya hai",
+        "outofstock_text": "Rewards ᴏᴜᴛ ᴏғ sᴛᴏᴄᴋ",
+    }
+    for k, marker in legacy.items():
+        cur = one("SELECT val FROM settings WHERE key=?", (k,))
+        if cur and cur["val"] and marker in cur["val"]:
+            ss(k, DEFAULT_SETTINGS[k])
 
 
 def gs(key, default=""):
@@ -225,6 +247,33 @@ def ss(key, val):
       (key, str(val)))
 
 
+def db_restore_from(src_path: str) -> None:
+    """Uploaded .db file se current database replace kare (safe swap + .bak)."""
+    global _conn
+    with open(src_path, "rb") as f:
+        head = f.read(16)
+    if not head.startswith(b"SQLite format 3"):
+        raise ValueError("Ye valid SQLite database file nahi hai.")
+    with _lock:
+        _conn.commit()
+        _conn.close()
+        try:
+            if os.path.exists(DB_PATH):
+                shutil.copyfile(DB_PATH, DB_PATH + ".bak")
+            for suffix in ("-wal", "-shm"):
+                p = DB_PATH + suffix
+                if os.path.exists(p):
+                    os.remove(p)
+            os.replace(src_path, DB_PATH)
+        finally:
+            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            _conn.row_factory = sqlite3.Row
+            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn.execute("PRAGMA synchronous=NORMAL")
+    db_init()
+    _join_cache.clear()
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  SMALL UTILS
 # ════════════════════════════════════════════════════════════════════════
@@ -235,6 +284,25 @@ def now() -> int:
 
 def esc(x) -> str:
     return html.escape(str(x if x is not None else ""))
+
+
+def normalize_phone(raw: str) -> str:
+    """Any format → 10-digit Indian number (no country code)."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]           # 91XXXXXXXXXX → XXXXXXXXXX
+    elif digits.startswith("0") and len(digits) == 11:
+        digits = digits[1:]           # 0XXXXXXXXXX → XXXXXXXXXX
+    return digits
+
+
+def is_phone(raw: str) -> bool:
+    return len(normalize_phone(raw)) == 10
+
+
+def wa_link(number: str) -> str:
+    """WhatsApp deeplink for an Indian number."""
+    return f"https://wa.me/91{normalize_phone(number)}"
 
 
 def fmt_ts(ts) -> str:
@@ -389,10 +457,18 @@ async def gate_keyboard(bot, missing):
 # ════════════════════════════════════════════════════════════════════════
 
 def rewards_left() -> int:
-    if gs("reward_mode") == "shared":
+    mode = gs("reward_mode")
+    if mode in ("shared", "cyclic"):
         total = scalar("SELECT COUNT(*) FROM rewards")
-        return 9999 if total else 0
+        return 9999 if total else 0   # pool hai to kabhi khatam nahi hota
     return int(scalar("SELECT COUNT(*) FROM rewards WHERE used_by IS NULL"))
+
+
+def stock_label() -> str:
+    left = rewards_left()
+    if gs("reward_mode") in ("shared", "cyclic") and left:
+        return "∞"
+    return str(left)
 
 
 def claim_state(u):
@@ -414,14 +490,26 @@ def claim_state(u):
 def take_reward(uid: int, kind: str):
     mode = gs("reward_mode")
     with _lock:
-        if mode == "shared":
+        if mode == "cyclic":
+            # Pool rotate hota hai: user ke claim-count ke hisaab se agla number,
+            # pool khatam hone par wapas pehle number se (wrap-around).
             pool = rows("SELECT * FROM rewards ORDER BY id")
             if not pool:
                 return None
             u = get_user(uid)
             idx = int(u["claims"] or 0) % len(pool)
             r = pool[idx]
-        else:
+            prev = str(r["used_by"] or "")
+            new_val = f"{prev},{uid}".strip(",")
+            q("UPDATE rewards SET used_by=?, used_at=? WHERE id=?", (new_val, now(), r["id"]))
+        elif mode == "shared":
+            pool = rows("SELECT * FROM rewards ORDER BY id")
+            if not pool:
+                return None
+            u = get_user(uid)
+            idx = int(u["claims"] or 0) % len(pool)
+            r = pool[idx]
+        else:  # unique (default)
             r = one("SELECT * FROM rewards WHERE used_by IS NULL ORDER BY id LIMIT 1")
             if not r:
                 return None
@@ -432,8 +520,11 @@ def take_reward(uid: int, kind: str):
     return r
 
 
-def reward_buttons_kb(extra_back=True):
+def reward_buttons_kb(code=None):
+    """Contact Now (WhatsApp) + admin custom buttons + Refer & Earn."""
     kb = []
+    if code and is_phone(code):
+        kb.append([InlineKeyboardButton("📲 Cᴏɴᴛᴀᴄᴛ Nᴏᴡ", url=wa_link(code))])
     try:
         data = json.loads(gs("reward_buttons") or "[]")
     except Exception:  # noqa: BLE001
@@ -449,11 +540,7 @@ def reward_buttons_kb(extra_back=True):
             row = []
     if row:
         kb.append(row)
-    if extra_back:
-        kb.append([
-            InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer"),
-            InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu"),
-        ])
+    kb.append([InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer")])
     return InlineKeyboardMarkup(kb)
 
 
@@ -461,17 +548,13 @@ def reward_buttons_kb(extra_back=True):
 #  USER SIDE UI
 # ════════════════════════════════════════════════════════════════════════
 
-def main_menu_kb(u):
-    can, need, kind = claim_state(u)
-    claim_label = "🎁 Cʟᴀɪᴍ Yᴏᴜʀ Fɪʀsᴛ Bᴏɴᴜs" if int(u["claims"] or 0) == 0 else "🎁 Cʟᴀɪᴍ Rᴇᴡᴀʀᴅ"
+def main_menu_kb(u=None):
     kb = [
-        [InlineKeyboardButton(claim_label, callback_data="claim")],
-        [InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer"),
-         InlineKeyboardButton("👤 Mʏ Pʀᴏғɪʟᴇ", callback_data="profile")],
-        [InlineKeyboardButton("🏆 Lᴇᴀᴅᴇʀʙᴏᴀʀᴅ", callback_data="top"),
-         InlineKeyboardButton("🎟 Mʏ Rᴇᴡᴀʀᴅs", callback_data="myrewards")],
-        [InlineKeyboardButton("❓ Hᴇʟᴘ", callback_data="help"),
-         InlineKeyboardButton(f"👨‍💻 {DEV_NAME}", url=f"https://t.me/{DEV_USERNAME}")],
+        [InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")],
+        [
+            InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer"),
+            InlineKeyboardButton("🏆 Lᴇᴀᴅᴇʀʙᴏᴀʀᴅ", callback_data="top"),
+        ],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -479,16 +562,18 @@ def main_menu_kb(u):
 def render(text: str, u_row, tg_user=None) -> str:
     per = max(1, gi("refs_per_reward", 1))
     name = (tg_user.first_name if tg_user else None) or (u_row["first_name"] if u_row else "User")
+    nxt = "—"
+    if u_row:
+        can, need, _ = claim_state(u_row)
+        nxt = "READY ✅" if can else f"{need} referral aur"
     return (text or "")\
         .replace("{name}", esc(name))\
         .replace("{per}", str(per))\
         .replace("{refs}", str(int(u_row["refs"] or 0) if u_row else 0))\
         .replace("{claims}", str(int(u_row["claims"] or 0) if u_row else 0))\
-        .replace("{stock}", str(rewards_left()))\
+        .replace("{stock}", stock_label())\
+        .replace("{next}", nxt)\
         .replace("{dev}", DEV_NAME)
-
-
-FOOTER = "\n\n<i>Bᴏᴛ ʙʏ</i> <b>{dev}</b>"
 
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
@@ -497,18 +582,9 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
     if not u:
         register_user(tg)
         u = get_user(tg.id)
-    can, need, kind = claim_state(u)
+    # Welcome template me hi stats ({refs} {claims} {stock} {next}) aur
+    # "Bot by {dev}" footer hai — ye footer sirf yahin dikhta hai.
     txt = render(gs("welcome_text"), u, tg)
-    txt += (
-        f"\n\n━━━━━━━━━━━━━━━\n"
-        f"👥 Rᴇғᴇʀʀᴀʟs : <b>{int(u['refs'] or 0)}</b>\n"
-        f"🎁 Rᴇᴡᴀʀᴅs Cʟᴀɪᴍᴇᴅ : <b>{int(u['claims'] or 0)}</b>\n"
-        f"📦 Sᴛᴏᴄᴋ Lᴇғᴛ : <b>{'∞' if gs('reward_mode') == 'shared' and rewards_left() else rewards_left()}</b>\n"
-        f"━━━━━━━━━━━━━━━"
-    )
-    if not can:
-        txt += f"\n\n⚠️ Next reward ke liye <b>{need}</b> referral chahiye."
-    txt += FOOTER.replace("{dev}", DEV_NAME)
 
     kb = main_menu_kb(u)
     photo = gs("start_photo").strip()
@@ -535,7 +611,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
 async def show_gate(update: Update, context: ContextTypes.DEFAULT_TYPE, missing, edit=False):
     tg = update.effective_user
     u = get_user(tg.id)
-    txt = render(gs("gate_text"), u, tg) + FOOTER.replace("{dev}", DEV_NAME)
+    txt = render(gs("gate_text"), u, tg)
     kb = await gate_keyboard(context.bot, missing)
     if edit and update.callback_query:
         try:
@@ -563,8 +639,8 @@ async def credit_referral(context: ContextTypes.DEFAULT_TYPE, uid: int):
     ref = get_user(rb)
     if ref and gi("notify_referrer", 1) == 1:
         can, need, _ = claim_state(ref)
-        tail = ("🎉 Aapka reward <b>ready</b> hai — Claim kijiye!"
-                if can else f"Aur <b>{need}</b> referral me next reward unlock hoga.")
+        tail = ("🎉 Aapka <b>Agent Number ready</b> hai — Claim kijiye!"
+                if can else f"Aur <b>{need}</b> referral me next Agent Number unlock hoga.")
         try:
             await context.bot.send_message(
                 rb,
@@ -573,7 +649,7 @@ async def credit_referral(context: ContextTypes.DEFAULT_TYPE, uid: int):
                 f"👥 Total Referrals : <b>{int(ref['refs'] or 0)}</b>\n\n{tail}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🎁 Cʟᴀɪᴍ Rᴇᴡᴀʀᴅ", callback_data="claim")]]),
+                    [[InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")]]),
             )
         except Exception:  # noqa: BLE001
             pass
@@ -624,29 +700,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(update, context)
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    per = max(1, gi("refs_per_reward", 1))
-    txt = (
-        "❓ <b>Hᴏᴡ ɪᴛ ᴡᴏʀᴋs</b>\n\n"
-        "1️⃣ Saare force-join channels join kijiye.\n"
-        "2️⃣ <b>Claim Your First Bonus</b> dabaiye — free reward code milega.\n"
-        f"3️⃣ Uske baad har <b>{per} referral</b> par ek naya reward code unlock hota hai.\n"
-        "4️⃣ Refer & Earn se apna link share kijiye.\n\n"
-        "<b>Cᴏᴍᴍᴀɴᴅs</b>\n"
-        "/start – menu\n/claim – reward claim\n/refer – referral link\n"
-        "/profile – aapki details\n/top – leaderboard\n/help – ye message"
-        + FOOTER.replace("{dev}", DEV_NAME)
-    )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")]])
-    if update.callback_query:
-        try:
-            return await update.callback_query.edit_message_text(
-                txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except BadRequest:
-            return
-    await update.effective_message.reply_html(txt, reply_markup=kb)
-
-
 async def do_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg = update.effective_user
     cq = update.callback_query
@@ -669,8 +722,8 @@ async def do_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     can, need, kind = claim_state(u)
     if not can:
         per = max(1, gi("refs_per_reward", 1))
-        popup = (f"🔒 Reward locked!\n\nAur {need} referral chahiye "
-                 f"({per} referral = 1 reward).\n\nRefer & Earn button dabaiye 👇")
+        popup = (f"🔒 Agent Number locked!\n\nAur {need} referral chahiye "
+                 f"({per} referral = 1 Agent Number).\n\nRefer & Earn button dabaiye 👇")
         if cq:
             await cq.answer(popup, show_alert=True)
         return await show_refer(update, context, edit=bool(cq))
@@ -678,10 +731,10 @@ async def do_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = take_reward(tg.id, kind)
     if not r:
         q("INSERT OR IGNORE INTO waitlist(user_id,ts) VALUES(?,?)", (tg.id, now()))
-        txt = gs("outofstock_text") + FOOTER.replace("{dev}", DEV_NAME)
+        txt = render(gs("outofstock_text"), u, tg)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")]])
         if cq:
-            await cq.answer("😔 Rewards out of stock!", show_alert=True)
+            await cq.answer("😔 Agent Numbers out of stock!", show_alert=True)
             try:
                 return await cq.edit_message_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
             except BadRequest:
@@ -690,43 +743,46 @@ async def do_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     u2 = get_user(tg.id)
     can2, need2, _ = claim_state(u2)
+    code = str(r["code"])
     body = render(gs("reward_text"), u2, tg)
     txt = (
         f"{body}\n\n"
-        f"╭━━━━━━━━━━━━━━━━╮\n"
-        f"🎁 <b>Yᴏᴜʀ Rᴇᴡᴀʀᴅ</b>\n"
-        f"╰━━━━━━━━━━━━━━━━╯\n"
-        f"<code>{esc(r['code'])}</code>\n\n"
-        f"🏷 Type : <b>{'Free Bonus' if kind == 'bonus' else 'Referral Reward'}</b>\n"
+        f"✅ <b>This is your Google Map Rating Agent Number:</b>\n\n"
+        f"┌─────────────────────────┐\n"
+        f"│  📱  <code>{esc(code)}</code>\n"
+        f"└─────────────────────────┘\n\n"
+        f"📋 Type : <b>{'Free Bonus' if kind == 'bonus' else 'Agent Number Reward'}</b>\n"
         f"👥 Referrals : <b>{int(u2['refs'] or 0)}</b>\n"
-        f"🎟 Total Claimed : <b>{int(u2['claims'] or 0)}</b>\n"
+        f"🔢 Total Claimed : <b>{int(u2['claims'] or 0)}</b>\n\n"
+        f"📲 Ye number WhatsApp pe available hai.\n"
+        f"Contact karo aur apna <b>Google Map Rating task</b> lo!\n\n"
     )
-    txt += ("\n✅ Next reward bhi ready hai — dobara Claim dabaiye!"
-            if can2 else f"\n👥 Next reward ke liye <b>{need2}</b> referral chahiye.")
-    txt += FOOTER.replace("{dev}", DEV_NAME)
+    txt += ("✅ <b>Agla number bhi ready hai — dobara Claim dabao!</b>"
+            if can2 else f"👥 Next number ke liye <b>{need2}</b> referral chahiye.")
+    reward_kb = reward_buttons_kb(code)
 
     if cq:
-        await cq.answer("🎉 Reward unlocked!")
+        await cq.answer("🎉 Agent Number unlocked!")
         try:
-            await cq.edit_message_text(txt, reply_markup=reward_buttons_kb(),
+            await cq.edit_message_text(txt, reply_markup=reward_kb,
                                        parse_mode=ParseMode.HTML,
                                        disable_web_page_preview=True)
         except BadRequest:
-            await context.bot.send_message(tg.id, txt, reply_markup=reward_buttons_kb(),
+            await context.bot.send_message(tg.id, txt, reply_markup=reward_kb,
                                            parse_mode=ParseMode.HTML)
     else:
-        await update.effective_message.reply_html(txt, reply_markup=reward_buttons_kb())
+        await update.effective_message.reply_html(txt, reply_markup=reward_kb)
 
     await send_log(context,
-                   f"🎁 <b>Reward Claimed</b>\n👤 {esc(tg.first_name)} (<code>{tg.id}</code>)\n"
-                   f"🔑 <code>{esc(r['code'])}</code>\n🏷 {kind}\n📦 Left: {rewards_left()}")
+                   f"📱 <b>Agent Number Claimed</b>\n👤 {esc(tg.first_name)} (<code>{tg.id}</code>)\n"
+                   f"🔑 <code>{esc(code)}</code>\n🏷 {kind}\n📦 Left: {stock_label()}")
 
     left = rewards_left()
-    if gs("reward_mode") != "shared" and left in (0, 1, 2):
+    if gs("reward_mode") not in ("shared", "cyclic") and left in (0, 1, 2):
         for a in admin_ids():
             try:
                 await context.bot.send_message(
-                    a, f"⚠️ <b>Rewards Stock Alert</b>\nSirf <b>{left}</b> reward bache hain.\n"
+                    a, f"⚠️ <b>Agent Number Stock Alert</b>\nSirf <b>{left}</b> number bache hain.\n"
                        f"Admin Panel → Rewards Manager se add kijiye.",
                     parse_mode=ParseMode.HTML)
             except Exception:  # noqa: BLE001
@@ -746,26 +802,25 @@ async def show_refer(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fa
     can, need, _ = claim_state(u)
     txt = (
         "👥 <b>Rᴇғᴇʀ & Eᴀʀɴ</b>\n\n"
-        f"Har <b>{per} referral</b> = <b>1 Reward Code</b> 🎁\n\n"
+        f"Har <b>{per} referral</b> = <b>1 Agent Number</b> 📱\n\n"
         "🔗 <b>Yᴏᴜʀ Lɪɴᴋ</b>\n"
         f"<code>{esc(link)}</code>\n\n"
         "━━━━━━━━━━━━━━━\n"
         f"👤 Total Invited : <b>{invited}</b>\n"
         f"✅ Verified : <b>{verified}</b>\n"
-        f"🎟 Rewards Claimed : <b>{int(u['claims'] or 0)}</b>\n"
+        f"📱 Numbers Claimed : <b>{int(u['claims'] or 0)}</b>\n"
         "━━━━━━━━━━━━━━━\n\n"
-        + ("🎉 Aapka reward ready hai — Claim kijiye!"
-           if can else f"⏳ Next reward : <b>{need}</b> referral aur.")
+        + ("🎉 Aapka Agent Number ready hai — Claim kijiye!"
+           if can else f"⏳ Next Agent Number : <b>{need}</b> referral aur.")
         + "\n\n<i>Note: Referral tab count hoga jab aapka friend saare channels join kar le.</i>"
-        + FOOTER.replace("{dev}", DEV_NAME)
     )
     share = (
         "https://t.me/share/url?url=" + link +
-        "&text=" + "🎁%20Free%20Reward%20Codes%20le%20lo%20is%20bot%20se!"
+        "&text=" + "📱%20Free%20Google%20Map%20Rating%20Agent%20Number%20le%20lo%20is%20bot%20se!"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Sʜᴀʀᴇ Lɪɴᴋ", url=share)],
-        [InlineKeyboardButton("🎁 Cʟᴀɪᴍ Rᴇᴡᴀʀᴅ", callback_data="claim")],
+        [InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")],
         [InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")],
     ])
     if edit and update.callback_query:
@@ -777,42 +832,6 @@ async def show_refer(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fa
             return
     await context.bot.send_message(tg.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML,
                                    disable_web_page_preview=True)
-
-
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
-    tg = update.effective_user
-    u = get_user(tg.id)
-    if not u:
-        register_user(tg)
-        u = get_user(tg.id)
-    rank = int(scalar("SELECT COUNT(*) FROM users WHERE refs > ?", (int(u["refs"] or 0),))) + 1
-    can, need, _ = claim_state(u)
-    txt = (
-        "👤 <b>Mʏ Pʀᴏғɪʟᴇ</b>\n\n"
-        f"🏷 Name : <b>{esc(u['first_name'])}</b>\n"
-        f"🆔 ID : <code>{tg.id}</code>\n"
-        f"📛 Username : @{esc(u['username']) if u['username'] else '—'}\n"
-        f"📅 Joined : <b>{fmt_ts(u['joined_at'])}</b>\n"
-        f"✅ Verified : <b>{'Yes' if int(u['verified'] or 0) else 'No'}</b>\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"👥 Referrals : <b>{int(u['refs'] or 0)}</b>\n"
-        f"🎟 Rewards : <b>{int(u['claims'] or 0)}</b>\n"
-        f"🏆 Rank : <b>#{rank}</b>\n"
-        f"🎁 Next Reward : <b>{'READY ✅' if can else str(need) + ' referral baaki'}</b>\n"
-        + FOOTER.replace("{dev}", DEV_NAME)
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎁 Cʟᴀɪᴍ", callback_data="claim"),
-         InlineKeyboardButton("👥 Rᴇғᴇʀ", callback_data="refer")],
-        [InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")],
-    ])
-    if edit and update.callback_query:
-        try:
-            return await update.callback_query.edit_message_text(txt, reply_markup=kb,
-                                                                 parse_mode=ParseMode.HTML)
-        except BadRequest:
-            return
-    await update.effective_message.reply_html(txt, reply_markup=kb)
 
 
 async def show_top(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
@@ -828,32 +847,11 @@ async def show_top(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fals
     if me:
         rank = int(scalar("SELECT COUNT(*) FROM users WHERE refs > ?", (int(me["refs"] or 0),))) + 1
         lines.append(f"\n━━━━━━━━━━━━━━━\n👤 Your Rank : <b>#{rank}</b> ({int(me['refs'] or 0)} refs)")
-    txt = "\n".join(lines) + FOOTER.replace("{dev}", DEV_NAME)
+    txt = "\n".join(lines)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer")],
         [InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")],
     ])
-    if edit and update.callback_query:
-        try:
-            return await update.callback_query.edit_message_text(txt, reply_markup=kb,
-                                                                 parse_mode=ParseMode.HTML)
-        except BadRequest:
-            return
-    await update.effective_message.reply_html(txt, reply_markup=kb)
-
-
-async def show_myrewards(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
-    uid = update.effective_user.id
-    cl = rows("SELECT code,kind,claimed_at FROM claims WHERE user_id=? "
-              "ORDER BY id DESC LIMIT 10", (uid,))
-    lines = ["🎟 <b>Mʏ Rᴇᴡᴀʀᴅs</b>\n"]
-    if not cl:
-        lines.append("<i>Abhi tak koi reward claim nahi kiya.</i>")
-    for c in cl:
-        tag = "🎁 Bonus" if c["kind"] == "bonus" else "👥 Referral"
-        lines.append(f"{tag} • <code>{esc(c['code'])}</code>\n<i>{fmt_ts(c['claimed_at'])}</i>\n")
-    txt = "\n".join(lines) + FOOTER.replace("{dev}", DEV_NAME)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")]])
     if edit and update.callback_query:
         try:
             return await update.callback_query.edit_message_text(txt, reply_markup=kb,
@@ -889,13 +887,14 @@ def back_kb(target="a_home"):
 
 async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=True):
     context.user_data.pop("state", None)
+    context.user_data.pop("bc_button", None)
     total = int(scalar("SELECT COUNT(*) FROM users"))
-    left = rewards_left()
     txt = (
         "👑 <b>Aᴅᴍɪɴ Cᴏɴᴛʀᴏʟ Pᴀɴᴇʟ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"👥 Users : <b>{total}</b>\n"
-        f"📦 Rewards Left : <b>{'∞' if gs('reward_mode') == 'shared' and left else left}</b>\n"
+        f"📦 Numbers Left : <b>{stock_label()}</b>\n"
+        f"🎛 Mode : <b>{gs('reward_mode').upper()}</b>\n"
         f"🔗 Refs / Reward : <b>{gi('refs_per_reward', 1)}</b>\n"
         f"📢 Force Join : <b>{'ON ✅' if gi('force_join', 1) else 'OFF ❌'}</b>\n"
         f"🛠 Maintenance : <b>{'ON ⚠️' if gi('maintenance', 0) else 'OFF ✅'}</b>\n"
@@ -962,19 +961,26 @@ async def a_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = int(scalar("SELECT COUNT(*) FROM rewards"))
     used = int(scalar("SELECT COUNT(*) FROM rewards WHERE used_by IS NOT NULL"))
     mode = gs("reward_mode")
+    mode_label = {
+        "unique": "UNIQUE (1 number = 1 user)",
+        "shared": "SHARED (repeat allowed)",
+        "cyclic": "CYCLIC (pool rotate → wrap-around)",
+    }.get(mode, mode.upper())
     txt = (
-        "🎁 <b>Rᴇᴡᴀʀᴅ Vᴀᴜʟᴛ</b>\n"
+        "📱 <b>Aɢᴇɴᴛ Nᴜᴍʙᴇʀ Pᴏᴏʟ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📦 Total Codes : <b>{total}</b>\n"
+        f"📦 Total Numbers : <b>{total}</b>\n"
         f"✅ Used : <b>{used}</b>\n"
-        f"🆓 Available : <b>{total - used}</b>\n"
-        f"🎛 Mode : <b>{'UNIQUE (1 code = 1 user)' if mode == 'unique' else 'SHARED (repeat allowed)'}</b>\n"
+        f"🆓 Available : <b>{stock_label() if mode != 'unique' else total - used}</b>\n"
+        f"🎛 Mode : <b>{mode_label}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "<b>Aᴅᴅ Cᴏᴅᴇs :</b> ek message me 5-6 codes bhi daal sakte hain — "
-        "har line par ek code. User ko upar se niche ek-ek karke jayega."
+        "<b>Aᴅᴅ Nᴜᴍʙᴇʀs :</b> ek message me bulk numbers daal sakte hain — har line par ek. "
+        "Koi bhi format chalega (+91, 91, spaces), auto-normalize ho jayega.\n\n"
+        "<b>Mᴏᴅᴇs :</b> UNIQUE = har user ko alag number, khatam to out-of-stock • "
+        "SHARED = pool repeat • CYCLIC = 20 numbers / 100 users → 1..20, phir wapas 1 se."
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Aᴅᴅ Rᴇᴡᴀʀᴅ Cᴏᴅᴇs", callback_data="a_rw_add")],
+        [InlineKeyboardButton("➕ Aᴅᴅ Aɢᴇɴᴛ Nᴜᴍʙᴇʀs", callback_data="a_rw_add")],
         [InlineKeyboardButton("📋 Lɪsᴛ / Dᴇʟᴇᴛᴇ", callback_data="a_rw_list")],
         [InlineKeyboardButton("🔘 Rᴇᴡᴀʀᴅ Bᴜᴛᴛᴏɴs", callback_data="a_rw_btn"),
          InlineKeyboardButton("✍️ Rᴇᴡᴀʀᴅ Tᴇxᴛ", callback_data="a_set_rwtext")],
@@ -992,14 +998,17 @@ async def a_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def a_rw_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rw = rows("SELECT * FROM rewards ORDER BY id LIMIT 30")
-    lines = ["📋 <b>Rᴇᴡᴀʀᴅ Cᴏᴅᴇs</b> (max 30 shown)\n"]
+    lines = ["📋 <b>Aɢᴇɴᴛ Nᴜᴍʙᴇʀs</b> (max 30 shown)\n"]
     kb = []
     if not rw:
-        lines.append("<i>Koi reward code add nahi hai.</i>")
+        lines.append("<i>Koi agent number add nahi hai.</i>")
     for r in rw:
         mark = "✅" if r["used_by"] else "🆓"
+        used = str(r["used_by"] or "")
+        if len(used) > 40:
+            used = used[:40] + "…"
         lines.append(f"{mark} <code>{esc(r['code'])}</code>"
-                     + (f" → <code>{r['used_by']}</code>" if r["used_by"] else ""))
+                     + (f" → <code>{esc(used)}</code>" if used else ""))
         kb.append([InlineKeyboardButton(f"🗑 {r['code'][:28]}", callback_data=f"a_rw_del:{r['id']}")])
     kb.append([InlineKeyboardButton("⬅️ Bᴀᴄᴋ", callback_data="a_rw")])
     try:
@@ -1019,11 +1028,11 @@ async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 int(r["user_id"]),
-                "🎉 <b>Nᴇᴡ Rᴇᴡᴀʀᴅs Aᴅᴅᴇᴅ!</b>\n\n"
-                "Stock refill ho gaya hai — abhi apna reward claim kijiye 👇",
+                "🎉 <b>Nᴇᴡ Aɢᴇɴᴛ Nᴜᴍʙᴇʀs Aᴅᴅᴇᴅ!</b>\n\n"
+                "Stock refill ho gaya hai — abhi apna Agent Number claim kijiye 👇",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🎁 Cʟᴀɪᴍ Nᴏᴡ", callback_data="claim")]]))
+                    [[InlineKeyboardButton("🎫 Cʟᴀɪᴍ Nᴏᴡ", callback_data="claim")]]))
             sent += 1
         except Exception:  # noqa: BLE001
             pass
@@ -1114,7 +1123,7 @@ async def a_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🗒 Log Channel : <b>{esc(gs('log_channel')) or '—'}</b>\n"
         f"🖼 Start Photo : <b>{'SET ✅' if gs('start_photo') else '—'}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Text me {name} {per} {refs} {claims} {stock} {dev} variables use kar sakte hain.</i>"
+        "<i>Text me {name} {per} {refs} {claims} {stock} {next} {dev} variables use kar sakte hain.</i>"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Rᴇғs ᴘᴇʀ Rᴇᴡᴀʀᴅ", callback_data="a_set_refs")],
@@ -1241,7 +1250,8 @@ async def a_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_broadcast(context: ContextTypes.DEFAULT_TYPE, admin_id: int,
-                        from_chat: int, msg_id: int, status_msg_id: int, pin: bool = False):
+                        from_chat: int, msg_id: int, status_msg_id: int, pin: bool = False,
+                        reply_markup=None):
     users = rows("SELECT user_id FROM users WHERE blocked=0")
     total = len(users)
     ok = fail = 0
@@ -1250,7 +1260,7 @@ async def run_broadcast(context: ContextTypes.DEFAULT_TYPE, admin_id: int,
         uid = int(r["user_id"])
         try:
             m = await context.bot.copy_message(chat_id=uid, from_chat_id=from_chat,
-                                               message_id=msg_id)
+                                               message_id=msg_id, reply_markup=reply_markup)
             ok += 1
             if pin:
                 try:
@@ -1262,7 +1272,7 @@ async def run_broadcast(context: ContextTypes.DEFAULT_TYPE, admin_id: int,
             await asyncio.sleep(float(e.retry_after) + 1)
             try:
                 await context.bot.copy_message(chat_id=uid, from_chat_id=from_chat,
-                                               message_id=msg_id)
+                                               message_id=msg_id, reply_markup=reply_markup)
                 ok += 1
             except Exception:  # noqa: BLE001
                 fail += 1
@@ -1306,12 +1316,13 @@ async def a_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "🛠 <b>Tᴏᴏʟs & Bᴀᴄᴋᴜᴘ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "• Users CSV export\n• Reward codes export\n• Full database backup\n"
+        "• Users CSV export\n• Agent numbers export\n• Full database backup\n"
+        "• <b>DB Restore</b> : backup wali <code>.db</code> file yahan bhej dijiye\n"
         "• Join-cache clear (force re-check)\n• Waitlist ko manually notify"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Usᴇʀs CSV", callback_data="a_exp_users"),
-         InlineKeyboardButton("📤 Cᴏᴅᴇs TXT", callback_data="a_exp_codes")],
+         InlineKeyboardButton("📤 Nᴜᴍʙᴇʀs TXT", callback_data="a_exp_codes")],
         [InlineKeyboardButton("💾 DB Bᴀᴄᴋᴜᴘ", callback_data="a_backup")],
         [InlineKeyboardButton("♻️ Cʟᴇᴀʀ Jᴏɪɴ Cᴀᴄʜᴇ", callback_data="a_clr_cache"),
          InlineKeyboardButton("🔔 Nᴏᴛɪғʏ Wᴀɪᴛʟɪsᴛ", callback_data="a_wl_notify")],
@@ -1389,20 +1400,29 @@ async def a_top_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════
 
 ASK_TEXT = {
-    "rw_add": ("➕ <b>Aᴅᴅ Rᴇᴡᴀʀᴅ Cᴏᴅᴇs</b>\n\nHar line par ek code bhejiye.\n\n"
-               "<b>Example :</b>\n<code>GOOGLE-MAP-AGENT-01\nGOOGLE-MAP-AGENT-02\n"
-               "GOOGLE-MAP-AGENT-03</code>\n\n❌ /cancel"),
+    "rw_add": ("➕ <b>Aᴅᴅ Aɢᴇɴᴛ Nᴜᴍʙᴇʀs</b>\n\n"
+               "Har line par ek number bhejiye.\n"
+               "<b>Koi bhi format chalega:</b>\n\n"
+               "<code>9876543210\n"
+               "+919876543210\n"
+               "919876543210\n"
+               "+91 98765 43210</code>\n\n"
+               "Bulk add ke liye ek baar me sab bhejiye 👆\n\n"
+               "❌ /cancel"),
     "set_refs": ("🔗 <b>Rᴇғᴇʀʀᴀʟs ᴘᴇʀ Rᴇᴡᴀʀᴅ</b>\n\nEk number bhejiye (jaise <code>1</code> "
-                 "ya <code>3</code>).\nMatlab: itne referral = 1 reward code.\n\n❌ /cancel"),
+                 "ya <code>3</code>).\nMatlab: itne referral = 1 Agent Number.\n\n❌ /cancel"),
     "set_welcome": ("✍️ <b>Wᴇʟᴄᴏᴍᴇ Tᴇxᴛ</b>\n\nNaya text bhejiye. HTML allowed "
                     "(&lt;b&gt;bold&lt;/b&gt;).\nVariables: {name} {per} {refs} {claims} "
-                    "{stock} {dev}\n\n❌ /cancel"),
+                    "{stock} {next} {dev}\n\n❌ /cancel"),
     "set_rwtext": ("✍️ <b>Rᴇᴡᴀʀᴅ Mᴇssᴀɢᴇ Tᴇxᴛ</b>\n\nReward ke sath jo message jayega wo "
                    "bhejiye.\nVariables: {name} {refs} {claims} {dev}\n\n❌ /cancel"),
     "set_gate": ("🔒 <b>Fᴏʀᴄᴇ-Jᴏɪɴ Tᴇxᴛ</b>\n\nJoin screen ka message bhejiye.\n\n❌ /cancel"),
     "set_oos": ("😔 <b>Oᴜᴛ-ᴏғ-Sᴛᴏᴄᴋ Tᴇxᴛ</b>\n\nRewards khatam hone par jo message jayega.\n\n❌ /cancel"),
-    "set_photo": ("🖼 <b>Sᴛᴀʀᴛ Pʜᴏᴛᴏ</b>\n\nEk photo bhejiye ya image URL.\n"
-                  "Hatane ke liye <code>clear</code> bhejiye.\n\n❌ /cancel"),
+    "set_photo": ("🖼 <b>Wᴇʟᴄᴏᴍᴇ Iᴍᴀɢᴇ Sᴇᴛ Kᴀʀᴏ</b>\n\n"
+                  "📤 Ek photo bhejiye — ye welcome message ke saath dikhegi.\n"
+                  "🔗 Ya image URL bhejiye.\n"
+                  "🗑 Hatane ke liye <code>clear</code> type karo.\n\n"
+                  "❌ /cancel"),
     "set_log": ("🗒 <b>Lᴏɢ Cʜᴀɴɴᴇʟ</b>\n\nChannel ID bhejiye (<code>-100...</code>) — bot "
                 "wahan admin ho.\nHatane ke liye <code>clear</code>.\n\n❌ /cancel"),
     "rw_btn": ("🔘 <b>Rᴇᴡᴀʀᴅ Bᴜᴛᴛᴏɴs</b>\n\nHar line par: <code>Button Text - https://link</code>\n\n"
@@ -1481,18 +1501,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "refer":
         await cq.answer()
         return await show_refer(update, context, edit=True)
-    if data == "profile":
-        await cq.answer()
-        return await show_profile(update, context, edit=True)
     if data == "top":
         await cq.answer()
         return await show_top(update, context, edit=True)
-    if data == "myrewards":
-        await cq.answer()
-        return await show_myrewards(update, context, edit=True)
-    if data == "help":
-        await cq.answer()
-        return await cmd_help(update, context)
 
     # ───── ADMIN ─────
     await cq.answer()
@@ -1513,13 +1524,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q("DELETE FROM rewards WHERE id=?", (int(arg),))
         return await a_rw_list(update, context)
     if data == "a_rw_clrused":
-        q("DELETE FROM rewards WHERE used_by IS NOT NULL")
+        if gs("reward_mode") == "unique":
+            q("DELETE FROM rewards WHERE used_by IS NOT NULL")
+        else:
+            # shared / cyclic: numbers pool me rehte hain, sirf usage tracking reset
+            q("UPDATE rewards SET used_by=NULL, used_at=NULL")
         return await a_rewards(update, context)
     if data == "a_rw_clrall":
         q("DELETE FROM rewards")
         return await a_rewards(update, context)
     if data == "a_rw_mode":
-        ss("reward_mode", "shared" if gs("reward_mode") == "unique" else "unique")
+        order = ["unique", "shared", "cyclic"]
+        cur = gs("reward_mode")
+        nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "unique"
+        ss("reward_mode", nxt)
         return await a_rewards(update, context)
 
     if data == "a_ch":
@@ -1621,12 +1639,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = int(arg)
         r = take_reward(tid, "gift")
         if not r:
-            return await cq.answer("❌ Stock khatam — pehle codes add kijiye.", show_alert=True)
+            return await cq.answer("❌ Stock khatam — pehle numbers add kijiye.", show_alert=True)
+        code = str(r["code"])
         try:
             await context.bot.send_message(
                 tid,
-                f"🎁 <b>Aᴅᴍɪɴ Gɪғᴛ Rᴇᴡᴀʀᴅ!</b>\n\n<code>{esc(r['code'])}</code>",
-                parse_mode=ParseMode.HTML, reply_markup=reward_buttons_kb())
+                f"🎁 <b>Aᴅᴍɪɴ Gɪғᴛ — Aɢᴇɴᴛ Nᴜᴍʙᴇʀ!</b>\n\n"
+                f"┌─────────────────────────┐\n"
+                f"│  📱  <code>{esc(code)}</code>\n"
+                f"└─────────────────────────┘\n\n"
+                f"📲 WhatsApp pe contact karo aur apna <b>Google Map Rating task</b> lo!",
+                parse_mode=ParseMode.HTML, reply_markup=reward_buttons_kb(code))
         except Exception:  # noqa: BLE001
             pass
         await cq.answer("🎁 Gift bhej diya!")
@@ -1634,12 +1657,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "a_bc":
         return await a_broadcast(update, context)
+    if data == "a_bc_addbtn":
+        if not context.user_data.get("bc"):
+            return await cq.answer("❌ Pehle broadcast message bhejiye.", show_alert=True)
+        context.user_data["state"] = "bc_btn"
+        try:
+            await cq.edit_message_text(
+                "🔘 <b>Bʀᴏᴀᴅᴄᴀsᴛ Bᴜᴛᴛᴏɴ</b>\n\n"
+                "Format: <code>Button Text - https://link</code>\n\n"
+                "Example: <code>🌐 Visit Now - https://example.com</code>\n\n❌ /cancel",
+                parse_mode=ParseMode.HTML, reply_markup=back_kb("a_home"),
+                disable_web_page_preview=True)
+        except BadRequest:
+            pass
+        return
     if data in ("a_bc_go", "a_bc_pin"):
         bc = context.user_data.get("bc")
         if not bc:
             return await cq.answer("❌ Message expire ho gaya, dobara try kijiye.",
                                    show_alert=True)
         context.user_data.pop("state", None)
+        bc_btn = context.user_data.pop("bc_button", None)
+        markup = None
+        if bc_btn:
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton(bc_btn["text"], url=bc_btn["url"])]])
         try:
             await cq.edit_message_text("📣 <b>Bʀᴏᴀᴅᴄᴀsᴛ sᴛᴀʀᴛᴇᴅ…</b>",
                                        parse_mode=ParseMode.HTML)
@@ -1647,7 +1688,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         context.application.create_task(
             run_broadcast(context, uid, bc[0], bc[1], cq.message.message_id,
-                          pin=(data == "a_bc_pin")))
+                          pin=(data == "a_bc_pin"), reply_markup=markup))
         return
 
     if data == "a_top":
@@ -1697,14 +1738,43 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with _lock:
                 _conn.commit()
+                _conn.execute("PRAGMA wal_checkpoint(FULL)")
             with open(DB_PATH, "rb") as f:
                 bio = io.BytesIO(f.read())
-            bio.name = "backup.db"
-            await context.bot.send_document(uid, bio, filename="backup.db",
-                                            caption="💾 Database backup")
+            fname = f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            bio.name = fname
+            await context.bot.send_document(
+                uid, bio, filename=fname,
+                caption="💾 <b>Database Backup</b>\n\nYe file safe rakhein. "
+                        "Restore karne ke liye isi file ko bot me wapas bhej dijiye.",
+                parse_mode=ParseMode.HTML)
         except Exception as e:  # noqa: BLE001
             await context.bot.send_message(uid, f"❌ Backup fail: {esc(e)}",
                                            parse_mode=ParseMode.HTML)
+        return
+    if data == "a_restore_yes":
+        file_id = context.user_data.pop("restore_file_id", None)
+        context.user_data.pop("state", None)
+        if not file_id:
+            return await cq.answer("❌ File nahi mili — dobara .db file bhejiye.", show_alert=True)
+        tmp = DB_PATH + ".restore"
+        try:
+            f = await context.bot.get_file(file_id)
+            await f.download_to_drive(tmp)
+            db_restore_from(tmp)
+        except Exception as e:  # noqa: BLE001
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return await context.bot.send_message(uid, f"❌ Restore fail: {esc(e)}",
+                                                  parse_mode=ParseMode.HTML)
+        try:
+            await cq.edit_message_text(
+                "✅ <b>Database restore ho gaya!</b>\n\n"
+                "Bot ab naye data ke saath kaam karega. "
+                f"Purana DB <code>{esc(os.path.basename(DB_PATH))}.bak</code> me safe hai.",
+                parse_mode=ParseMode.HTML, reply_markup=back_kb("a_tools"))
+        except BadRequest:
+            pass
         return
 
 
@@ -1726,6 +1796,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get("state")
 
+    # ── DB RESTORE (admin .db file upload, jab koi aur state active na ho) ──
+    if (not state or state == "db_restore_confirm") and msg.document and is_admin(tg.id):
+        fname = (msg.document.file_name or "").lower()
+        if fname.endswith((".db", ".sqlite", ".sqlite3")):
+            context.user_data["state"] = "db_restore_confirm"
+            context.user_data["restore_file_id"] = msg.document.file_id
+            return await msg.reply_html(
+                "⚠️ <b>DB Rᴇsᴛᴏʀᴇ Cᴏɴғɪʀᴍ</b>\n\n"
+                f"📄 File: <code>{esc(msg.document.file_name)}</code>\n\n"
+                "Kya aap sure hain? <b>Current data replace ho jayega.</b>\n"
+                "Ye action undo nahi hoga! (purane DB ki ek .bak copy server pe rahegi)",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yᴇs, Rᴇsᴛᴏʀᴇ", callback_data="a_restore_yes")],
+                    [InlineKeyboardButton("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")],
+                ]))
+
     if not state:
         if int(u["blocked"] or 0) == 1:
             return
@@ -1744,31 +1830,63 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "bc_wait":
         context.user_data["bc"] = (msg.chat_id, msg.message_id)
         total = int(scalar("SELECT COUNT(*) FROM users WHERE blocked=0"))
+        context.user_data.pop("bc_button", None)
         return await msg.reply_html(
-            f"📣 <b>Cᴏɴғɪʀᴍ Bʀᴏᴀᴅᴄᴀsᴛ</b>\n\nYe message <b>{total}</b> users ko jayega.",
+            f"📣 <b>Cᴏɴғɪʀᴍ Bʀᴏᴀᴅᴄᴀsᴛ</b>\n\nYe message <b>{total}</b> users ko jayega.\n"
+            "Chaho to pehle ek URL button add kar sakte ho.",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔘 Aᴅᴅ Bᴜᴛᴛᴏɴ", callback_data="a_bc_addbtn")],
                 [InlineKeyboardButton("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
                 [InlineKeyboardButton("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
                 [InlineKeyboardButton("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")],
             ]))
 
-    # ── REWARD CODES ──
-    if state == "rw_add":
-        codes = [c.strip() for c in text.splitlines() if c.strip()]
-        if not codes:
-            return await msg.reply_html("❌ Koi valid code nahi mila. Dobara bhejiye.")
-        added = 0
-        for c in codes:
-            q("INSERT INTO rewards(code,added_at) VALUES(?,?)", (c, now()))
-            added += 1
+    # ── BROADCAST BUTTON ──
+    if state == "bc_btn":
+        if "-" not in text:
+            return await msg.reply_html("❌ Format: <code>Text - URL</code>")
+        t, _, url = text.partition("-")
+        t, url = t.strip(), url.strip()
+        if not t or not url.startswith(("http://", "https://", "tg://")):
+            return await msg.reply_html("❌ Valid URL chahiye. Format: <code>Text - https://link</code>")
+        context.user_data["bc_button"] = {"text": t[:40], "url": url}
         context.user_data.pop("state", None)
-        sent = await notify_waitlist(context)
         return await msg.reply_html(
-            f"✅ <b>{added} reward code add ho gaye!</b>\n\n"
-            f"📦 Available : <b>{rewards_left()}</b>\n"
-            f"🔔 Waitlist notified : <b>{sent}</b>\n\n"
-            f"<i>Order:</i> user ko upar se niche ek-ek code jayega.",
-            reply_markup=back_kb("a_rw"))
+            f"✅ Button set: <b>{esc(t)}</b> → {esc(url)}\n\nAb broadcast karo.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
+                [InlineKeyboardButton("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
+                [InlineKeyboardButton("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")],
+            ]), disable_web_page_preview=True)
+
+    # ── AGENT NUMBERS (bulk add + normalize) ──
+    if state == "rw_add":
+        raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not raw_lines:
+            return await msg.reply_html("❌ Koi valid number nahi mila. Dobara bhejiye.")
+        added = 0
+        skipped = []
+        for line in raw_lines:
+            normalized = normalize_phone(line)
+            if len(normalized) == 10:
+                q("INSERT INTO rewards(code,added_at) VALUES(?,?)", (normalized, now()))
+                added += 1
+            elif len(line) >= 5:
+                # Non-phone code bhi accept (jaise GOOGLE-MAP-AGENT-01)
+                q("INSERT INTO rewards(code,added_at) VALUES(?,?)", (line, now()))
+                added += 1
+            else:
+                skipped.append(line)
+        context.user_data.pop("state", None)
+        sent = await notify_waitlist(context) if added else 0
+        reply = (
+            f"✅ <b>{added} numbers/codes add ho gaye!</b>\n\n"
+            f"📦 Available : <b>{stock_label()}</b>\n"
+            f"🔔 Waitlist notified : <b>{sent}</b>\n"
+        )
+        if skipped:
+            reply += f"\n⚠️ Skip hua: {esc(', '.join(skipped))}"
+        return await msg.reply_html(reply, reply_markup=back_kb("a_rw"))
 
     # ── REWARD BUTTONS ──
     if state == "rw_btn":
@@ -1928,6 +2046,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("state", None)
     context.user_data.pop("bc", None)
+    context.user_data.pop("bc_button", None)
+    context.user_data.pop("restore_file_id", None)
     await update.effective_message.reply_html("❌ Cancel ho gaya.")
 
 
@@ -1965,10 +2085,10 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             uid,
             "✅ <b>Vᴇʀɪғɪᴄᴀᴛɪᴏɴ Cᴏᴍᴘʟᴇᴛᴇ!</b>\n\n"
-            "Aapka access unlock ho gaya 🎉\nAbhi apna <b>First Bonus</b> claim kijiye 👇",
+            "Aapka access unlock ho gaya 🎉\nAbhi apna pehla <b>Agent Number</b> claim kijiye 👇",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎁 Cʟᴀɪᴍ Yᴏᴜʀ Fɪʀsᴛ Bᴏɴᴜs", callback_data="claim")],
+                [InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")],
                 [InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")],
             ]))
     except Exception:  # noqa: BLE001
@@ -2021,10 +2141,6 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_refer(update, context)
 
 
-async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_profile(update, context)
-
-
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_top(update, context)
 
@@ -2049,7 +2165,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_html(
         f"👥 Users : <b>{int(scalar('SELECT COUNT(*) FROM users'))}</b>\n"
         f"🎟 Claims : <b>{int(scalar('SELECT COUNT(*) FROM claims'))}</b>\n"
-        f"📦 Rewards Left : <b>{rewards_left()}</b>")
+        f"📦 Numbers Left : <b>{stock_label()}</b>")
 
 
 async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2076,11 +2192,9 @@ async def post_init(app: Application):
         from telegram import BotCommand
         await app.bot.set_my_commands([
             BotCommand("start", "Bot start / menu"),
-            BotCommand("claim", "Reward claim kare"),
+            BotCommand("claim", "Agent Number claim kare"),
             BotCommand("refer", "Referral link"),
-            BotCommand("profile", "Aapki details"),
             BotCommand("top", "Leaderboard"),
-            BotCommand("help", "Help"),
         ])
     except Exception:  # noqa: BLE001
         pass
@@ -2111,10 +2225,8 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("claim", cmd_claim))
     app.add_handler(CommandHandler("refer", cmd_refer))
-    app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("top", cmd_top))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("panel", cmd_admin))
