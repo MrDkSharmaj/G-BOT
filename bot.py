@@ -155,9 +155,9 @@ DEFAULT_SETTINGS = {
     ),
     "reward_buttons": "[]",
     "gate_text": (
-        "🔒 <b>Join Required</b>\n\n"
-        "Bot use karne ke liye niche diya gaya channel join kijiye "
-        "(ya join request bhejiye), phir <b>✅ Continue</b> dabaiye."
+        "📢 <b>Join Required</b>\n\n"
+        "Please join the {channels} below to continue using the bot.\n"
+        "✅ Join the {channels} and then tap <b>Continue</b>."
     ),
     "outofstock_text": (
         "😔 <b>Aɢᴇɴᴛ Nᴜᴍʙᴇʀs ᴏᴜᴛ ᴏғ sᴛᴏᴄᴋ!</b>\n\n"
@@ -269,8 +269,10 @@ def db_init():
         "reward_text": "Aapka reward unlock ho gaya hai",
         "outofstock_text": "Rewards ᴏᴜᴛ ᴏғ sᴛᴏᴄᴋ",
         "gate_text": "Vᴇʀɪғɪᴇᴅ",
+        "gate_text ": "Bot use karne ke liye niche diya gaya channel",
     }
     for k, marker in legacy.items():
+        k = k.strip()
         cur = one("SELECT val FROM settings WHERE key=?", (k,))
         if cur and cur["val"] and marker in cur["val"]:
             ss(k, DEFAULT_SETTINGS[k])
@@ -558,7 +560,8 @@ OK_STATUS = {
     ChatMemberStatus.OWNER,
 }
 _join_cache: dict = {}     # uid -> (ts, [pending channels])
-CACHE_TTL = 45
+CACHE_TTL = 45           # normal cache
+FRESH_TTL = 3            # force_fresh par bhi double-tap absorb karne ke liye
 
 
 def all_channels():
@@ -624,7 +627,7 @@ async def pending_channels(bot, uid: int, force_fresh: bool = False):
     if not chans:
         return []
     hit = _join_cache.get(uid)
-    if hit and not force_fresh and now() - hit[0] < CACHE_TTL:
+    if hit and now() - hit[0] < (FRESH_TTL if force_fresh else CACHE_TTL):
         return hit[1]
 
     missing = []
@@ -650,19 +653,43 @@ async def pending_channels(bot, uid: int, force_fresh: bool = False):
 
 
 async def gate_keyboard(bot, missing):
-    """Clean gate: sirf Join button(s) + Continue. Koi dev/powered-by nahi."""
-    kb = []
+    """Clean gate: Join buttons (max 2 per row) + full-width Continue.
+    Koi dev/powered-by nahi."""
     single = len(missing) == 1
+    buttons = []
     for ch in missing:
         link = await ensure_link(bot, ch)
         if not link:
             continue
         label = (ch["btn_text"] or "").strip()
         if not label:
-            label = "📢 Join Channel" if single else f"📢 Join • {ch['title'] or 'Channel'}"
-        kb.append([btn(label[:60], url=link)])
+            if single:
+                label = "📢 Join Channel"
+            else:
+                title = (ch["title"] or "Channel").strip()
+                label = f"📢 Join • {title[:14]}"      # 2-column row me fit rahe
+        buttons.append(btn(label[:40], url=link))
+    kb = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]   # 2 per row
     kb.append([InlineKeyboardButton("✅ Continue", callback_data="verify")])
     return InlineKeyboardMarkup(kb)
+
+
+async def require_join(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=None) -> bool:
+    """Har user-action se pehle mandatory-join check (hamesha FRESH, cache-bypass).
+    True = user blocked hai aur gate screen dikha di gayi.
+    Admins ko pending_channels() khud exempt karta hai."""
+    tg = update.effective_user
+    missing = await pending_channels(context.bot, tg.id, force_fresh=True)
+    if not missing:
+        return False
+    cq = update.callback_query
+    if cq:
+        try:
+            await cq.answer("🔒 Please join the required channel(s) first.", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+    await show_gate(update, context, missing, edit=bool(cq) if edit is None else edit)
+    return True
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -826,7 +853,8 @@ async def show_gate(update: Update, context: ContextTypes.DEFAULT_TYPE, missing,
     """Clean, minimal join screen: sirf Join button(s) + Continue."""
     tg = update.effective_user
     u = get_user(tg.id)
-    txt = render(gs("gate_text"), u, tg)
+    txt = render(gs("gate_text"), u, tg).replace(
+        "{channels}", "channel" if len(missing) == 1 else "channels")
     kb = await gate_keyboard(context.bot, missing)
     m = None
     if edit and update.callback_query:
@@ -923,14 +951,53 @@ def maintenance_on() -> bool:
     return gi("maintenance", 0) == 1
 
 
+_maint_notice_ts: dict = {}      # uid -> last maintenance notice (anti-spam)
+MAINT_NOTICE_COOLDOWN = 60       # seconds
+
+
+def is_user_interaction(update: Update) -> bool:
+    """True SIRF tab jab ek real (non-bot) user ne khud bot se interact kiya ho:
+    inline button press, ya private chat me apna message/command.
+
+    Ye sab FALSE hai → gate kabhi trigger nahi hota:
+      • service messages (pinned message, joined, title change…) — jaise broadcast
+        'Send + Pin' ke baad Telegram jo 'pinned a message' notice banata hai
+      • bot ke apne messages / bot accounts
+      • channel posts, membership updates, join requests
+      • background tasks (broadcast workers) — inme koi update hota hi nahi
+    """
+    tg = update.effective_user
+    if not tg or getattr(tg, "is_bot", False):
+        return False
+    if update.callback_query:
+        return True
+    msg = update.message
+    if not msg:
+        return False
+    chat = update.effective_chat
+    if not chat or chat.type != "private":
+        return False
+    if msg.from_user is None or msg.from_user.is_bot:
+        return False
+    if (msg.pinned_message or msg.new_chat_members or msg.left_chat_member
+            or msg.new_chat_title or msg.new_chat_photo or msg.delete_chat_photo
+            or msg.group_chat_created or msg.message_auto_delete_timer_changed):
+        return False
+    return bool(msg.text or msg.caption or msg.effective_attachment)
+
+
 async def maintenance_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group -1 middleware. Maintenance ON → sirf NORMAL USERS ke direct
+    interactions block hote hain. Admin ka har action (panel, commands,
+    broadcast start/pause/resume/stop) aur har background/service update
+    bina chhue aage nikal jata hai — maintenance text yahin se, aur sirf
+    yahin se, bheja jata hai."""
     if not maintenance_on():
         return
-    tg = update.effective_user
-    if not tg or is_admin(tg.id):
+    if not is_user_interaction(update):
         return
-    # membership / join-request tracking maintenance me bhi chalta rahe
-    if update.chat_join_request or update.chat_member or update.my_chat_member:
+    tg = update.effective_user
+    if is_admin(tg.id):
         return
     txt = gs("maintenance_text")
     cq = update.callback_query
@@ -952,14 +1019,15 @@ async def maintenance_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:  # noqa: BLE001
                     pass
         raise ApplicationHandlerStop
-    if update.message and update.effective_chat and update.effective_chat.type == "private":
+    # Plain message/command from a normal user → ek notice, per user max 1 / minute
+    last = _maint_notice_ts.get(tg.id, 0)
+    if now() - last >= MAINT_NOTICE_COOLDOWN:
+        _maint_notice_ts[tg.id] = now()
         try:
             await update.message.reply_html(txt)
         except Exception:  # noqa: BLE001
             pass
-        raise ApplicationHandlerStop
-    if update.inline_query or update.edited_message:
-        raise ApplicationHandlerStop
+    raise ApplicationHandlerStop
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -2231,10 +2299,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ───── USER ─────
     if data == "menu":
+        if await require_join(update, context):
+            return
         await cq.answer()
-        missing = await pending_channels(context.bot, uid)
-        if missing:
-            return await show_gate(update, context, missing, edit=True)
         return await show_menu(update, context, edit=True)
 
     if data == "verify":
@@ -2242,8 +2309,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if missing:
             names = ", ".join((c["title"] or "Channel") for c in missing)
             await cq.answer(
-                f"❌ Abhi pending: {names}\n\nChannel join kijiye ya join request bhejiye, "
-                f"phir Continue dabaiye.", show_alert=True)
+                f"❌ Not joined yet: {names}\n\nPlease join the channel"
+                f"{'s' if len(missing) > 1 else ''} above, then tap Continue.", show_alert=True)
             return await show_gate(update, context, missing, edit=True)
         await cq.answer("✅ Verified!")
         if int(u["verified"] or 0) == 0:
@@ -2255,9 +2322,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "claim":
         return await do_claim(update, context)
     if data == "refer":
+        if await require_join(update, context):
+            return
         await cq.answer()
         return await show_refer(update, context, edit=True)
     if data == "top":
+        if await require_join(update, context):
+            return
         await cq.answer()
         return await show_top(update, context, edit=True)
 
@@ -2643,7 +2714,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     tg = update.effective_user
-    if not msg or not tg:
+    if not msg or not tg or not is_user_interaction(update):
         return
     u = get_user(tg.id)
     if not u:
@@ -2673,9 +2744,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state:
         if int(u["blocked"] or 0) == 1:
             return
-        missing = await pending_channels(context.bot, tg.id)
-        if missing:
-            return await show_gate(update, context, missing)
+        if await require_join(update, context):
+            return
         return await show_menu(update, context)
 
     if not is_admin(tg.id):
@@ -3100,13 +3170,14 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    missing = await pending_channels(context.bot, update.effective_user.id)
-    if missing:
-        return await show_gate(update, context, missing)
+    if await require_join(update, context):
+        return
     await show_refer(update, context)
 
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await require_join(update, context):
+        return
     await show_top(update, context)
 
 
@@ -3225,7 +3296,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, on_message))
     app.add_error_handler(on_error)
 
     log.info("Polling start… Developer: %s", DEV_NAME)
