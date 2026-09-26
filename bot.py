@@ -524,12 +524,35 @@ STATIC_BUTTON_DEFAULTS = {
 }
 
 
-def button_registry():
+def _json_dict(raw) -> dict:
+    """Parse a settings blob into a dict; anything unusable becomes {}."""
     try:
-        data = json.loads(gs("button_registry") or "{}")
-        return data if isinstance(data, dict) else {}
-    except (TypeError, ValueError, json.JSONDecodeError):
+        data = json.loads(raw or "{}")
+    except Exception:  # noqa: BLE001
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clean_btncfg(data: dict) -> dict:
+    """Normalise stored values so no later .get()/index can fail on a bad row."""
+    out = {}
+    for key, val in (data or {}).items():
+        if not isinstance(key, str) or not isinstance(val, dict):
+            continue
+        row = {}
+        for field in ("label", "emoji", "style"):
+            v = val.get(field)
+            if isinstance(v, str) and v.strip():
+                row[field] = v.strip()
+        if val.get("remove_emoji"):
+            row["remove_emoji"] = True
+        out[key] = row
+    return out
+
+
+def button_registry():
+    data = _json_dict(gs("button_registry"))
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, dict)}
 
 
 def save_button_registry(data: dict) -> None:
@@ -537,25 +560,16 @@ def save_button_registry(data: dict) -> None:
 
 
 def button_config():
-    """Read the global registry, migrating the previous user-only config once."""
-    try:
-        data = json.loads(gs("button_config") or "{}")
-        if not isinstance(data, dict):
-            data = {}
-    except (TypeError, ValueError, json.JSONDecodeError):
-        data = {}
+    """Read the global button config, migrating the previous user-only config once."""
+    data = _clean_btncfg(_json_dict(gs("button_config")))
     if not data:
-        try:
-            old = json.loads(gs("user_button_config") or "{}")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            old = {}
+        old = _clean_btncfg(_json_dict(gs("user_button_config")))
         old_map = {"leaderboard": "top", "share": "url:share", "contact": "url:contact",
                    "continue": "verify"}
-        if isinstance(old, dict):
-            for old_key, value in old.items():
-                data[old_map.get(old_key, old_key)] = value
-            if data:
-                save_button_config(data)
+        for old_key, value in old.items():
+            data[old_map.get(old_key, old_key)] = value
+        if data:
+            save_button_config(data)
     return data
 
 
@@ -1791,6 +1805,16 @@ def button_short_label(key: str, idx: int, page: int) -> str:
 
 async def a_button_customizer(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     context.user_data.pop("state", None)
+    try:
+        return await _render_customizer(update, context, page)
+    except Exception as e:  # noqa: BLE001
+        log.error("button customizer failed: %s", e, exc_info=e)
+        return await edit_or_send(update, context,
+                                  "⚠️ <b>Customizer open nahi ho paya.</b>\n\n"
+                                  f"<code>{esc(str(e)[:200])}</code>", back_kb("a_set"))
+
+
+async def _render_customizer(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     keys = _cfg_key_order()
     pages = max(1, (len(keys) + BTNCFG_PER_PAGE - 1) // BTNCFG_PER_PAGE)
     txt = ("🎨 <b>Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ</b>\n"
@@ -1803,6 +1827,14 @@ async def a_button_customizer(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def a_button_customizer_view(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
+    try:
+        return await _render_customizer_view(update, context, key)
+    except Exception as e:  # noqa: BLE001
+        log.error("button customizer view failed: %s", e, exc_info=e)
+        return await a_button_customizer(update, context)
+
+
+async def _render_customizer_view(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     if key not in button_registry() and key not in STATIC_BUTTON_DEFAULTS:
         return await a_button_customizer(update, context)
     keys = _cfg_key_order()
@@ -2573,10 +2605,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await a_set_preview(update, context)
     if data == "a_btncfg_noop":
         return await cq.answer()
+    if data.startswith("a_btncfg"):
+        log.info("btncfg callback: %s (arg=%r) by %s", data, arg, uid)
     if data == "a_btncfg":
         return await a_button_customizer(update, context)
     if data == "a_btncfg_pg":
-        return await a_button_customizer(update, context, int(arg or 0))
+        try:
+            page = int(arg or 0)
+        except (TypeError, ValueError):
+            page = 0
+        return await a_button_customizer(update, context, page)
     if data == "a_btncfg_v":
         return await a_button_customizer_view(update, context, arg)
     if data in ("a_btncfg_emoji", "a_btncfg_label"):
@@ -3471,6 +3509,14 @@ async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Update error: %s", context.error, exc_info=context.error)
+    # A callback that raises must never look like "nothing happened" to the admin.
+    cq = getattr(update, "callback_query", None)
+    if not cq:
+        return
+    try:
+        await cq.answer("⚠️ Kuch galat ho gaya. Dobara try kijiye.", show_alert=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ════════════════════════════════════════════════════════════════════════
