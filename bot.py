@@ -157,6 +157,19 @@ DEFAULT_SETTINGS = {
         "🎉 <b>Cᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴs {name}!</b> 🎉"
     ),
     "reward_buttons": "[]",
+    "refer_text": (
+        "👥 <b>Rᴇғᴇʀ & Eᴀʀɴ</b>\n\n"
+        "Har <b>{per} referral</b> = <b>1 Agent Number</b> 📱\n\n"
+        "🔗 <b>Yᴏᴜʀ Lɪɴᴋ</b>\n"
+        "<code>{link}</code>\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "👤 Total Invited : <b>{invited}</b>\n"
+        "✅ Verified : <b>{verified}</b>\n"
+        "📱 Numbers Claimed : <b>{claims}</b>\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "{status}\n\n"
+        "<i>Note: Referral tab count hoga jab aapka friend saare channels join kar le.</i>"
+    ),
     "gate_text": (
         "📢 <b>Join Required</b>\n\n"
         "Please join the {channels} below to continue using the bot.\n"
@@ -586,6 +599,11 @@ def strip_leading_emoji(text: str) -> str:
 
 
 def register_button(key: str, label: str, action: str = "") -> None:
+    # Only persist static / user-side keys. Dynamic admin callbacks (contain ":")
+    # used to accumulate forever in button_registry → huge JSON → customizer hang
+    # after heavy admin use / DB backup. Skip them so the registry stays small.
+    if ":" in key and not key.startswith("url:"):
+        return
     reg = button_registry()
     clean = plain_text(label).strip() or "•"
     old = reg.get(key)
@@ -970,14 +988,14 @@ def main_menu_kb(u=None):
     ])
 
 
-def render(text: str, u_row, tg_user=None) -> str:
+def render(text: str, u_row, tg_user=None, extra: dict = None) -> str:
     per = max(1, gi("refs_per_reward", 1))
     name = (tg_user.first_name if tg_user else None) or (u_row["first_name"] if u_row else "User")
     nxt = "—"
     if u_row:
         can, need, _ = claim_state(u_row)
         nxt = "READY ✅" if can else f"{need} referral aur"
-    return (text or "")\
+    out = (text or "")\
         .replace("{name}", esc(name))\
         .replace("{per}", str(per))\
         .replace("{refs}", str(int(u_row["refs"] or 0) if u_row else 0))\
@@ -985,6 +1003,10 @@ def render(text: str, u_row, tg_user=None) -> str:
         .replace("{stock}", stock_label())\
         .replace("{next}", nxt)\
         .replace("{dev}", DEV_NAME)
+    if extra:
+        for k, v in extra.items():
+            out = out.replace("{" + k + "}", str(v))
+    return out
 
 
 def menu_payload(uid: int, tg_user=None):
@@ -1299,25 +1321,19 @@ async def show_refer(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fa
     if not u:
         register_user(tg)
         u = get_user(tg.id)
-    per = max(1, gi("refs_per_reward", 1))
     link = ref_link(tg.id)
     invited = int(scalar("SELECT COUNT(*) FROM users WHERE ref_by=?", (tg.id,)))
     verified = int(scalar("SELECT COUNT(*) FROM users WHERE ref_by=? AND ref_done=1", (tg.id,)))
     can, need, _ = claim_state(u)
-    txt = (
-        "👥 <b>Rᴇғᴇʀ & Eᴀʀɴ</b>\n\n"
-        f"Har <b>{per} referral</b> = <b>1 Agent Number</b> 📱\n\n"
-        "🔗 <b>Yᴏᴜʀ Lɪɴᴋ</b>\n"
-        f"<code>{esc(link)}</code>\n\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"👤 Total Invited : <b>{invited}</b>\n"
-        f"✅ Verified : <b>{verified}</b>\n"
-        f"📱 Numbers Claimed : <b>{int(u['claims'] or 0)}</b>\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        + ("🎉 Aapka Agent Number ready hai — Claim kijiye!"
-           if can else f"⏳ Next Agent Number : <b>{need}</b> referral aur.")
-        + "\n\n<i>Note: Referral tab count hoga jab aapka friend saare channels join kar le.</i>"
-    )
+    status = ("🎉 Aapka Agent Number ready hai — Claim kijiye!"
+              if can else f"⏳ Next Agent Number : <b>{need}</b> referral aur.")
+    extra = {
+        "link": esc(link),
+        "invited": invited,
+        "verified": verified,
+        "status": status,
+    }
+    txt = render(gs("refer_text"), u, tg, extra=extra)
     share = (
         "https://t.me/share/url?url=" + link +
         "&text=" + "📱%20Free%20Google%20Map%20Rating%20Agent%20Number%20le%20lo%20is%20bot%20se!"
@@ -1708,6 +1724,7 @@ async def a_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🖼 Start Photo : <b>{'SET ✅' if gs('start_photo') else '—'}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "<i>Text me {name} {per} {refs} {claims} {stock} {next} {dev} variables use kar sakte hain.\n"
+        "Refer text me extra: {link} {invited} {verified} {status}\n"
         "💎 Premium emoji: text me seedha premium emoji type/paste karo — as-is save hoga.</i>"
     )
     kb = InlineKeyboardMarkup([
@@ -1722,10 +1739,11 @@ async def a_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               callback_data="a_t_notify")],
         [ikb("✍️ Wᴇʟᴄᴏᴍᴇ Tᴇxᴛ", callback_data="a_set_welcome"),
          ikb("✍️ Rᴇᴡᴀʀᴅ Tᴇxᴛ", callback_data="a_set_rwtext")],
-        [ikb("🔒 Gᴀᴛᴇ Tᴇxᴛ", callback_data="a_set_gate"),
-         ikb("😔 Oᴜᴛ-ᴏғ-Sᴛᴏᴄᴋ Tᴇxᴛ", callback_data="a_set_oos")],
-        [ikb("🛠 Mᴀɪɴᴛᴇɴᴀɴᴄᴇ Tᴇxᴛ", callback_data="a_set_maint"),
-         ikb("👁 Pʀᴇᴠɪᴇᴡ Tᴇxᴛs", callback_data="a_set_preview")],
+        [ikb("👥 Rᴇғᴇʀ & Eᴀʀɴ Tᴇxᴛ", callback_data="a_set_refer"),
+         ikb("🔒 Gᴀᴛᴇ Tᴇxᴛ", callback_data="a_set_gate")],
+        [ikb("😔 Oᴜᴛ-ᴏғ-Sᴛᴏᴄᴋ Tᴇxᴛ", callback_data="a_set_oos"),
+         ikb("🛠 Mᴀɪɴᴛᴇɴᴀɴᴄᴇ Tᴇxᴛ", callback_data="a_set_maint")],
+        [ikb("👁 Pʀᴇᴠɪᴇᴡ Tᴇxᴛs", callback_data="a_set_preview")],
         [ikb(f"💎 Pʀᴇᴍɪᴜᴍ Bᴜᴛᴛᴏɴ Iᴄᴏɴs : {'ON' if gi('premium_btn_icons', 1) else 'OFF'}",
                               callback_data="a_t_pbtn")],
         [ikb("🎨 Usᴇʀ Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ", callback_data="a_btncfg_pg:0")],
@@ -1765,9 +1783,24 @@ def button_cfg_text(key: str) -> str:
 
 def _cfg_key_order():
     reg = button_registry()
+    # Prune any leftover dynamic keys (from older builds) so registry stays lean
+    # and User Button Customizer never hangs after DB backup / heavy admin use.
+    cleaned = {}
+    for k, v in reg.items():
+        if ":" in k and not k.startswith("url:"):
+            continue
+        cleaned[k] = v
     for key, label in STATIC_BUTTON_DEFAULTS.items():
-        reg.setdefault(key, {"label": label, "action": key})
-    save_button_registry(reg)
+        cleaned.setdefault(key, {"label": label, "action": key})
+    if cleaned != reg:
+        save_button_registry(cleaned)
+        reg = cleaned
+    else:
+        # still ensure statics are present
+        for key, label in STATIC_BUTTON_DEFAULTS.items():
+            reg.setdefault(key, {"label": label, "action": key})
+        if reg != button_registry():
+            save_button_registry(reg)
     user = [k for k in USER_SIDE_KEYS if k in reg]
     rest = sorted(k for k in reg if k not in USER_SIDE_KEYS)
     return user + rest
@@ -1867,6 +1900,22 @@ async def a_set_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:  # noqa: BLE001
             await context.bot.send_message(tg.id, f"⚠️ {label} text render fail: {esc(e)}",
                                            parse_mode=ParseMode.HTML)
+    # Refer & Earn (needs extra placeholders)
+    try:
+        link = ref_link(tg.id)
+        invited = int(scalar("SELECT COUNT(*) FROM users WHERE ref_by=?", (tg.id,)))
+        verified = int(scalar("SELECT COUNT(*) FROM users WHERE ref_by=? AND ref_done=1", (tg.id,)))
+        can, need, _ = claim_state(u) if u else (False, 0, "")
+        status = ("🎉 Aapka Agent Number ready hai — Claim kijiye!"
+                  if can else f"⏳ Next Agent Number : <b>{need}</b> referral aur.")
+        extra = {"link": esc(link), "invited": invited, "verified": verified, "status": status}
+        ref_preview = render(gs("refer_text"), u, tg, extra=extra)
+        await context.bot.send_message(
+            tg.id, "👁 <b>Refer & Earn Text Preview</b>\n━━━━━━━━━━━━━━━━━━\n" + ref_preview,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:  # noqa: BLE001
+        await context.bot.send_message(tg.id, f"⚠️ Refer text render fail: {esc(e)}",
+                                       parse_mode=ParseMode.HTML)
     await context.bot.send_message(tg.id, "⬆️ Ye texts users ko aise hi dikhenge.",
                                    reply_markup=back_kb("a_set"))
 
@@ -2398,6 +2447,10 @@ ASK_TEXT = {
                     "{claims} {stock} {next} {dev}" + PREMIUM_NOTE + "\n\n❌ /cancel"),
     "set_rwtext": ("✍️ <b>Rᴇᴡᴀʀᴅ Mᴇssᴀɢᴇ Tᴇxᴛ</b>\n\nReward ke sath jo message jayega wo "
                    "bhejiye.\nVariables: {name} {refs} {claims} {dev}" + PREMIUM_NOTE + "\n\n❌ /cancel"),
+    "set_refer": ("👥 <b>Rᴇғᴇʀ & Eᴀʀɴ Tᴇxᴛ</b>\n\nRefer & Earn screen ka message bhejiye.\n"
+                  "Variables: {name} {per} {refs} {claims} {stock} {next} {dev}\n"
+                  "Extra: {link} {invited} {verified} {status}"
+                  + PREMIUM_NOTE + "\n\n❌ /cancel"),
     "set_gate": ("🔒 <b>Jᴏɪɴ Sᴄʀᴇᴇɴ Tᴇxᴛ</b>\n\nChannel-join screen ka message bhejiye."
                  + PREMIUM_NOTE + "\n\n❌ /cancel"),
     "set_oos": ("😔 <b>Oᴜᴛ-ᴏғ-Sᴛᴏᴄᴋ Tᴇxᴛ</b>\n\nRewards khatam hone par jo message jayega."
@@ -2652,7 +2705,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "a_btncfg_reset":
         save_button_config({})
         return await a_button_customizer(update, context)
-    if data in ("a_set_refs", "a_set_welcome", "a_set_rwtext", "a_set_gate",
+    if data in ("a_set_refs", "a_set_welcome", "a_set_rwtext", "a_set_refer", "a_set_gate",
                 "a_set_oos", "a_set_maint", "a_set_photo", "a_set_log"):
         return await ask(update, context, data[2:], "a_set")
 
@@ -2906,6 +2959,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with _lock:
                 _conn.commit()
                 _conn.execute("PRAGMA wal_checkpoint(FULL)")
+                # Touch connection so any post-checkpoint state is healthy
+                # (prevents rare "stuck customizer" after backup on some hosts).
+                _conn.execute("SELECT 1").fetchone()
             with open(DB_PATH, "rb") as f:
                 bio = io.BytesIO(f.read())
             fname = f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
@@ -3119,6 +3175,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     simple = {
         "set_welcome": "welcome_text",
         "set_rwtext": "reward_text",
+        "set_refer": "refer_text",
         "set_gate": "gate_text",
         "set_oos": "outofstock_text",
         "set_maint": "maintenance_text",
@@ -3127,7 +3184,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rich:
             return await msg.reply_html("❌ Text bhejiye.")
         # Pehle render karke check karo ki HTML valid hai (galat tag save na ho)
-        preview = render(rich, get_user(tg.id), tg)
+        extra = None
+        if state == "set_refer":
+            link = ref_link(tg.id)
+            invited = int(scalar("SELECT COUNT(*) FROM users WHERE ref_by=?", (tg.id,)))
+            verified = int(scalar("SELECT COUNT(*) FROM users WHERE ref_by=? AND ref_done=1", (tg.id,)))
+            uu = get_user(tg.id)
+            can, need, _ = claim_state(uu) if uu else (False, 0, "")
+            status = ("🎉 Aapka Agent Number ready hai — Claim kijiye!"
+                      if can else f"⏳ Next Agent Number : <b>{need}</b> referral aur.")
+            extra = {"link": esc(link), "invited": invited, "verified": verified, "status": status}
+        preview = render(rich, get_user(tg.id), tg, extra=extra)
         try:
             await msg.reply_html("✅ <b>Text update ho gaya!</b>\n\n<b>Preview:</b>\n\n" + preview,
                                  reply_markup=back_kb("a_set"), disable_web_page_preview=True)
