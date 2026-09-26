@@ -510,6 +510,9 @@ BUTTON_STYLES = ("default", "primary", "success", "danger")
 # Every bot-owned button is registered automatically. This includes static user/admin
 # buttons and runtime-generated buttons. Config survives label changes because identity
 # is based on callback_data (or an explicit key for URL buttons).
+USER_SIDE_KEYS = ("claim", "refer", "top", "menu", "verify",
+                  "url:share", "url:contact")
+
 STATIC_BUTTON_DEFAULTS = {
     "claim": "🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ",
     "refer": "👥 Rᴇғᴇʀ & Eᴀʀɴ",
@@ -596,6 +599,8 @@ def button_parts(key: str, default_label: str):
     if emoji_html or remove_emoji:
         base = strip_leading_emoji(base)
     text = plain_text(base).strip() or "•"
+    text = strip_leading_emoji(text) if (emoji_html or remove_emoji) else text
+    text = text or "•"
     icon = None
     fallback = ""
     m = TG_EMOJI_RE.search(emoji_html)
@@ -1709,12 +1714,17 @@ async def a_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
          ikb("👁 Pʀᴇᴠɪᴇᴡ Tᴇxᴛs", callback_data="a_set_preview")],
         [ikb(f"💎 Pʀᴇᴍɪᴜᴍ Bᴜᴛᴛᴏɴ Iᴄᴏɴs : {'ON' if gi('premium_btn_icons', 1) else 'OFF'}",
                               callback_data="a_t_pbtn")],
-        [ikb("🎨 Usᴇʀ Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ", callback_data="a_btncfg")],
+        [ikb("🎨 Usᴇʀ Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ", callback_data="a_btncfg_pg:0")],
         [ikb("🖼 Sᴛᴀʀᴛ Pʜᴏᴛᴏ", callback_data="a_set_photo"),
          ikb("🗒 Lᴏɢ Cʜᴀɴɴᴇʟ", callback_data="a_set_log")],
         [ikb("⬅️ Bᴀᴄᴋ", callback_data="a_home")],
     ])
     await edit_or_send(update, context, txt, kb)
+
+
+BTNCFG_PER_PAGE = 8
+# Short, skin-toned glyphs keep the keyboard JSON small (Telegram rejects very long payloads).
+CFG_GLYPH = {"default": "⬜", "primary": "🟦", "success": "🟩", "danger": "🟥"}
 
 
 def button_cfg_text(key: str) -> str:
@@ -1724,49 +1734,88 @@ def button_cfg_text(key: str) -> str:
     label = str(cfg.get("label") or default)
     emoji = str(cfg.get("emoji") or "").strip()
     style = str(cfg.get("style") or "default").lower()
-    status = ("Premium" if TG_EMOJI_RE.search(emoji) else "Normal") if emoji else ("Removed" if cfg.get("remove_emoji") else "Default")
-    return (f"🔘 <b>{esc(key)}</b>\n"
-            f"Text: <code>{esc(strip_leading_emoji(label) if emoji or cfg.get('remove_emoji') else plain_text(label))}</code>\n"
-            f"Emoji: <b>{esc(status)}</b>\n"
-            f"Style: <b>{esc(style.upper())}</b>")
+    if emoji:
+        status = "Premium (set)" if TG_EMOJI_RE.search(emoji) else "Normal (set)"
+    elif cfg.get("remove_emoji"):
+        status = "Removed"
+    else:
+        status = "Default"
+    shown = strip_leading_emoji(label) if (emoji or cfg.get("remove_emoji")) else plain_text(label)
+    kind = "User" if key in USER_SIDE_KEYS else "Admin / Other"
+    return (f"🔘 <b>{esc(key)}</b> <i>({kind})</i>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Text : <code>{esc(shown)}</code>\n"
+            f"Emoji : <b>{esc(status)}</b>\n"
+            f"Color : <b>{esc(style.upper())}</b>")
 
 
-def button_customizer_kb():
+def _cfg_key_order():
     reg = button_registry()
     for key, label in STATIC_BUTTON_DEFAULTS.items():
         reg.setdefault(key, {"label": label, "action": key})
     save_button_registry(reg)
+    user = [k for k in USER_SIDE_KEYS if k in reg]
+    rest = sorted(k for k in reg if k not in USER_SIDE_KEYS)
+    return user + rest
+
+
+def button_customizer_kb(page: int = 0):
+    keys = _cfg_key_order()
+    pages = max(1, (len(keys) + BTNCFG_PER_PAGE - 1) // BTNCFG_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = keys[page * BTNCFG_PER_PAGE:(page + 1) * BTNCFG_PER_PAGE]
     cfg = button_config()
     kb = []
-    for key in sorted(reg):
-        label = reg[key].get("label") or key
-        style = str(cfg.get(key, {}).get("style") or "default").upper()
-        kb.append([ikb(f"{plain_text(label)[:28]} • {style}", callback_data=f"a_btncfg_v:{key}")])
+    for idx, key in enumerate(chunk):
+        style = str(cfg.get(key, {}).get("style") or "default").lower()
+        glyph = CFG_GLYPH.get(style, "⬜")
+        kb.append([ikb(f"{glyph} {button_short_label(key, idx, page)}",
+                       callback_data=f"a_btncfg_v:{key}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(ikb("⬅️ Pʀᴇᴠ", callback_data=f"a_btncfg_pg:{page - 1}"))
+        nav.append(ikb(f"{page + 1}/{pages}", callback_data="a_btncfg_noop"))
+        if page < pages - 1:
+            nav.append(ikb("Nᴇxᴛ ➡️", callback_data=f"a_btncfg_pg:{page + 1}"))
+        kb.append(nav)
     kb.append([ikb("♻️ Rᴇsᴇᴛ Aʟʟ", callback_data="a_btncfg_reset")])
     kb.append([ikb("⬅️ Bᴀᴄᴋ", callback_data="a_set")])
     return InlineKeyboardMarkup(kb)
 
 
-async def a_button_customizer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def button_short_label(key: str, idx: int, page: int) -> str:
+    """Tiny numeric handle — the full name lives in the button detail screen."""
+    return f"{page * BTNCFG_PER_PAGE + idx + 1}"
+
+
+async def a_button_customizer(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     context.user_data.pop("state", None)
-    txt = ("🎨 <b>Aʟʟ Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ</b>\n"
+    keys = _cfg_key_order()
+    pages = max(1, (len(keys) + BTNCFG_PER_PAGE - 1) // BTNCFG_PER_PAGE)
+    txt = ("🎨 <b>Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ</b>\n"
            "━━━━━━━━━━━━━━━━━━\n"
-           "User, Admin and discovered dynamic buttons are listed here. Each button has "
-           "independent text, replacement emoji and style settings.\n\nChoose a button:")
-    await edit_or_send(update, context, txt, button_customizer_kb())
+           "Kisi bhi button ka text, emoji aur color alag-alag badal sakte hain.\n"
+           f"Total buttons: <b>{len(keys)}</b> • Page <b>{max(1, min(page, pages - 1)) + 1}/{pages}</b>\n\n"
+           "Colors: ⬜ Default • 🟦 Primary • 🟩 Success • 🟥 Danger\n\n"
+           "Number dabaiye (full preview us screen me milega):")
+    await edit_or_send(update, context, txt, button_customizer_kb(page))
 
 
 async def a_button_customizer_view(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     if key not in button_registry() and key not in STATIC_BUTTON_DEFAULTS:
         return await a_button_customizer(update, context)
-    txt = button_cfg_text(key) + "\n\nPremium emoji replaces the old normal emoji; it is never appended."
+    keys = _cfg_key_order()
+    page = keys.index(key) // BTNCFG_PER_PAGE if key in keys else 0
+    txt = (button_cfg_text(key) + "\n\n"
+           "<i>Premium emoji purane normal emoji ko replace karta hai — saath me add nahi hota.</i>")
     kb = InlineKeyboardMarkup([
         [ikb("😀 Eᴅɪᴛ / Cʜᴀɴɢᴇ Eᴍᴏᴊɪ", callback_data=f"a_btncfg_emoji:{key}")],
         [ikb("🗑 Rᴇᴍᴏᴠᴇ Eᴍᴏᴊɪ", callback_data=f"a_btncfg_removeemoji:{key}")],
-        [ikb("✍️ Eᴅɪᴛ Tᴇxᴛ", callback_data=f"a_btncfg_label:{key}"),
-         ikb("🎨 Cʏᴄʟᴇ Cᴏʟᴏʀ", callback_data=f"a_btncfg_style:{key}")],
+        [ikb("✍️ Eᴅɪᴛ Tᴇxᴛ", callback_data=f"a_btncfg_label:{key}")],
+        [ikb("🎨 Cʏᴄʟᴇ Cᴏʟᴏʀ", callback_data=f"a_btncfg_style:{key}")],
         [ikb("♻️ Rᴇsᴇᴛ Tʜɪs Bᴜᴛᴛᴏɴ", callback_data=f"a_btncfg_resetone:{key}")],
-        [ikb("⬅️ Bᴀᴄᴋ", callback_data="a_btncfg")],
+        [ikb("⬅️ Bᴀᴄᴋ", callback_data=f"a_btncfg_pg:{page}")],
     ])
     await edit_or_send(update, context, txt, kb)
 
@@ -2522,8 +2571,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await a_settings(update, context)
     if data == "a_set_preview":
         return await a_set_preview(update, context)
+    if data == "a_btncfg_noop":
+        return await cq.answer()
     if data == "a_btncfg":
         return await a_button_customizer(update, context)
+    if data == "a_btncfg_pg":
+        return await a_button_customizer(update, context, int(arg or 0))
     if data == "a_btncfg_v":
         return await a_button_customizer_view(update, context, arg)
     if data in ("a_btncfg_emoji", "a_btncfg_label"):
