@@ -125,20 +125,16 @@ DEFAULT_SETTINGS = {
     "log_channel": "",
     "start_photo": "",
     "welcome_text": (
-        "🌟 <b>Wᴇʟᴄᴏᴍᴇ ᴛᴏ Gᴏᴏɢʟᴇ Mᴀᴘ Rᴀᴛɪɴɢ Rᴇᴠɪᴇᴡ Aɢᴇɴᴛ Nᴜᴍʙᴇʀs Bᴏᴛ!</b> 🗺️\n\n"
-        "📲 Yahan aapko milega ek dedicated <b>Google Map Rating Agent</b> ka WhatsApp number.\n\n"
-        "🔑 Pehla number <b>FREE</b> hai — bas claim karo!\n"
-        "👥 Har <b>{per} referral</b> pe ek naya <b>Agent Number</b> milega.\n"
-        "📞 Number milne ke baad seedha WhatsApp pe contact karo aur task lo!\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "👥 Rᴇғᴇʀʀᴀʟs : <b>{refs}</b>\n"
-        "📱 Nᴜᴍʙᴇʀs Cʟᴀɪᴍᴇᴅ : <b>{claims}</b>\n"
-        "📦 Sᴛᴏᴄᴋ Lᴇғᴛ : <b>{stock}</b>\n"
-        "🎯 Nᴇxᴛ Nᴜᴍʙᴇʀ : <b>{next}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Niche se shuru karo 👇\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>Bᴏᴛ ʙʏ</i> <b>{dev}</b>"
+        "🌟 <b>Google Map Rating Agent Bot</b> 🗺️\n\n"
+        "📲 Yahan milega <b>Google Map Agent</b> ka WhatsApp number.\n\n"
+        "🔑 Pehla number <b>FREE</b> hai!\n"
+        "👥 Har <b>{per} referral</b> = 1 naya <b>Agent Number</b>\n"
+        "📞 Number pe WhatsApp se task lo!\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "👥 Referrals: <b>{refs}</b>  •  Numbers: <b>{claims}</b>\n"
+        "🎯 Next: <b>{next}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "Shuru karo 👇 | <i>By {dev}</i>"
     ),
     "reward_text": (
         "🎉 <b>Cᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴs {name}!</b> 🎉"
