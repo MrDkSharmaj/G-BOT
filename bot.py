@@ -138,6 +138,7 @@ DEFAULT_SETTINGS = {
     "start_photo": "",
     "gc_prefix": "EARNINGZONE",       # gift code prefix
     "premium_btn_icons": "1",         # buttons par premium emoji icon (Bot API 9.4+)
+    "user_button_config": "{}",       # per user-side button: {key:{emoji,label,style}}
     "welcome_text": (
         "🌟 <b>Google Map Rating Agent Bot</b> 🗺️\n\n"
         "📲 Yahan milega <b>Google Map Agent</b> ka WhatsApp number.\n\n"
@@ -502,22 +503,64 @@ def split_button_label(label: str):
     return plain_text(label).strip(), icon
 
 
-def btn(label: str, *, url: str = None, cb: str = None) -> InlineKeyboardButton:
-    """InlineKeyboardButton with premium-emoji icon support (agar label me ho)."""
+BUTTON_STYLES = ("default", "primary", "success", "danger")
+USER_BUTTONS = {
+    "claim": ("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", "claim"),
+    "refer": ("👥 Rᴇғᴇʀ & Eᴀʀɴ", "refer"),
+    "leaderboard": ("🏆 Lᴇᴀᴅᴇʀʙᴏᴀʀᴅ", "top"),
+    "menu": ("🏠 Mᴇɴᴜ", "menu"),
+    "share": ("📤 Sʜᴀʀᴇ Lɪɴᴋ", None),
+    "contact": ("📲 Cᴏɴᴛᴀᴄᴛ Nᴏᴡ", None),
+    "continue": ("✅ Continue", "verify"),
+}
+
+
+def user_button_config():
+    try:
+        data = json.loads(gs("user_button_config") or "{}")
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_user_button_config(data: dict) -> None:
+    ss("user_button_config", json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def button_label_from_cfg(key: str, default: str) -> str:
+    cfg = user_button_config().get(key, {})
+    label = str(cfg.get("label") or default)
+    emoji = str(cfg.get("emoji") or "").strip()
+    if emoji:
+        label = f"{emoji} {plain_text(label).strip()}"
+    return label
+
+
+def btn(label: str, *, url: str = None, cb: str = None, style: str = None) -> InlineKeyboardButton:
+    """InlineKeyboardButton with optional premium icon and Bot API button style."""
     text, icon = split_button_label(label)
     text = (text or "•")[:64]
-    kwargs = {}
-    if url:
-        kwargs["url"] = url
-    else:
-        kwargs["callback_data"] = cb
+    kwargs = {"url": url} if url else {"callback_data": cb}
+    extra = {}
     if icon and gi("premium_btn_icons", 1) == 1:
-        # PTB ke naye versions me native field hai; purane me api_kwargs se jata hai.
-        try:
-            return InlineKeyboardButton(text, icon_custom_emoji_id=icon, **kwargs)
-        except TypeError:
-            return InlineKeyboardButton(text, api_kwargs={"icon_custom_emoji_id": icon}, **kwargs)
-    return InlineKeyboardButton(text, **kwargs)
+        extra["icon_custom_emoji_id"] = icon
+    if style in BUTTON_STYLES[1:]:
+        extra["style"] = style
+    if not extra:
+        return InlineKeyboardButton(text, **kwargs)
+    try:
+        return InlineKeyboardButton(text, **extra, **kwargs)
+    except TypeError:
+        # Old python-telegram-bot versions still pass unknown Bot API fields through api_kwargs.
+        return InlineKeyboardButton(text, api_kwargs=extra, **kwargs)
+
+
+def ubtn(key: str, *, url: str = None, cb: str = None, label: str = None) -> InlineKeyboardButton:
+    default, default_cb = USER_BUTTONS.get(key, (label or "•", cb))
+    cfg = user_button_config().get(key, {})
+    final_label = button_label_from_cfg(key, label or default)
+    style = str(cfg.get("style") or "default").lower()
+    return btn(final_label, url=url, cb=cb if cb is not None else default_cb, style=style)
 
 
 def parse_button_lines(text_html: str):
@@ -670,7 +713,7 @@ async def gate_keyboard(bot, missing):
                 label = f"📢 Join • {title[:14]}"      # 2-column row me fit rahe
         buttons.append(btn(label[:40], url=link))
     kb = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]   # 2 per row
-    kb.append([InlineKeyboardButton("✅ Continue", callback_data="verify")])
+    kb.append([ubtn("continue")])
     return InlineKeyboardMarkup(kb)
 
 
@@ -762,7 +805,7 @@ def reward_buttons_kb(code=None, refer=True):
     """Contact Now (WhatsApp) + admin custom buttons + Refer & Earn."""
     kb = []
     if code and is_phone(code):
-        kb.append([InlineKeyboardButton("📲 Cᴏɴᴛᴀᴄᴛ Nᴏᴡ", url=wa_link(code))])
+        kb.append([ubtn("contact", url=wa_link(code))])
     try:
         data = json.loads(gs("reward_buttons") or "[]")
     except Exception:  # noqa: BLE001
@@ -778,7 +821,7 @@ def reward_buttons_kb(code=None, refer=True):
     if row:
         kb.append(row)
     if refer:
-        kb.append([InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer")])
+        kb.append([ubtn("refer")])
     return InlineKeyboardMarkup(kb)
 
 
@@ -787,14 +830,10 @@ def reward_buttons_kb(code=None, refer=True):
 # ════════════════════════════════════════════════════════════════════════
 
 def main_menu_kb(u=None):
-    kb = [
-        [InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")],
-        [
-            InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer"),
-            InlineKeyboardButton("🏆 Lᴇᴀᴅᴇʀʙᴏᴀʀᴅ", callback_data="top"),
-        ],
-    ]
-    return InlineKeyboardMarkup(kb)
+    return InlineKeyboardMarkup([
+        [ubtn("claim")],
+        [ubtn("refer"), ubtn("leaderboard")],
+    ])
 
 
 def render(text: str, u_row, tg_user=None) -> str:
@@ -830,20 +869,40 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
     kb = main_menu_kb(u)
     photo = gs("start_photo").strip()
     if edit and update.callback_query:
+        cq = update.callback_query
         try:
-            await update.callback_query.edit_message_text(
-                txt, reply_markup=kb, parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True)
+            # Photo messages have captions, not text. Editing text on them raises BadRequest.
+            if cq.message and (cq.message.photo or cq.message.video or cq.message.animation
+                               or cq.message.document):
+                await cq.edit_message_caption(
+                    caption=txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+            else:
+                await cq.edit_message_text(
+                    txt, reply_markup=kb, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True)
             return
-        except BadRequest:
-            pass
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            # Never leave a callback hanging: send a fresh menu if media/text conversion fails.
+            try:
+                await cq.edit_message_reply_markup(reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+            if photo:
+                try:
+                    await context.bot.send_photo(tg.id, photo, caption=txt,
+                                                 reply_markup=kb, parse_mode=ParseMode.HTML)
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
     if photo and not edit:
         try:
             await context.bot.send_photo(tg.id, photo, caption=txt,
                                          reply_markup=kb, parse_mode=ParseMode.HTML)
             return
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("start photo send failed; falling back to text: %s", e)
     await context.bot.send_message(tg.id, txt, reply_markup=kb,
                                    parse_mode=ParseMode.HTML,
                                    disable_web_page_preview=True)
@@ -901,8 +960,8 @@ async def unlock_after_join(context: ContextTypes.DEFAULT_TYPE, uid: int, tg_use
             "Abhi apna <b>Agent Number</b> claim kijiye 👇",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")],
-                [InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")],
+                [ubtn("claim")],
+                [ubtn("menu")],
             ]))
     except Exception:  # noqa: BLE001
         pass
@@ -931,7 +990,7 @@ async def credit_referral(context: ContextTypes.DEFAULT_TYPE, uid: int):
                 f"👥 Total Referrals : <b>{int(ref['refs'] or 0)}</b>\n\n{tail}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")]]),
+                    [[ubtn("claim")]]),
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1099,7 +1158,7 @@ async def do_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not r:
         q("INSERT OR IGNORE INTO waitlist(user_id,ts) VALUES(?,?)", (tg.id, now()))
         txt = render(gs("outofstock_text"), u, tg)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")]])
+        kb = InlineKeyboardMarkup([[ubtn("menu")]])
         if cq:
             await cq.answer("😔 Agent Numbers out of stock!", show_alert=True)
             try:
@@ -1186,16 +1245,30 @@ async def show_refer(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fa
         "&text=" + "📱%20Free%20Google%20Map%20Rating%20Agent%20Number%20le%20lo%20is%20bot%20se!"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Sʜᴀʀᴇ Lɪɴᴋ", url=share)],
-        [InlineKeyboardButton("🎫 Cʟᴀɪᴍ Aɢᴇɴᴛ Nᴜᴍʙᴇʀ", callback_data="claim")],
-        [InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")],
+        [ubtn("share", url=share)],
+        [ubtn("claim")],
+        [ubtn("menu")],
     ])
     if edit and update.callback_query:
+        cq = update.callback_query
         try:
-            return await update.callback_query.edit_message_text(
+            if cq.message and (cq.message.photo or cq.message.video or cq.message.animation
+                               or cq.message.document):
+                try:
+                    await cq.edit_message_reply_markup(reply_markup=None)
+                except Exception:  # noqa: BLE001
+                    pass
+                return await context.bot.send_message(
+                    tg.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True)
+            return await cq.edit_message_text(
                 txt, reply_markup=kb, parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True)
-        except BadRequest:
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                return await context.bot.send_message(
+                    tg.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True)
             return
     await context.bot.send_message(tg.id, txt, reply_markup=kb, parse_mode=ParseMode.HTML,
                                    disable_web_page_preview=True)
@@ -1216,14 +1289,26 @@ async def show_top(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fals
         lines.append(f"\n━━━━━━━━━━━━━━━\n👤 Your Rank : <b>#{rank}</b> ({int(me['refs'] or 0)} refs)")
     txt = "\n".join(lines)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Rᴇғᴇʀ & Eᴀʀɴ", callback_data="refer")],
-        [InlineKeyboardButton("🏠 Mᴇɴᴜ", callback_data="menu")],
+        [ubtn("refer")],
+        [ubtn("menu")],
     ])
     if edit and update.callback_query:
+        cq = update.callback_query
         try:
-            return await update.callback_query.edit_message_text(txt, reply_markup=kb,
-                                                                 parse_mode=ParseMode.HTML)
-        except BadRequest:
+            if cq.message and (cq.message.photo or cq.message.video or cq.message.animation
+                               or cq.message.document):
+                try:
+                    await cq.edit_message_reply_markup(reply_markup=None)
+                except Exception:  # noqa: BLE001
+                    pass
+                return await context.bot.send_message(tg.id, txt, reply_markup=kb,
+                                                      parse_mode=ParseMode.HTML)
+            return await cq.edit_message_text(txt, reply_markup=kb,
+                                              parse_mode=ParseMode.HTML)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                return await context.bot.send_message(tg.id, txt, reply_markup=kb,
+                                                      parse_mode=ParseMode.HTML)
             return
     await update.effective_message.reply_html(txt, reply_markup=kb)
 
@@ -1508,7 +1593,7 @@ async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE):
                 "Stock refill ho gaya hai — abhi apna Agent Number claim kijiye 👇",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🎫 Cʟᴀɪᴍ Nᴏᴡ", callback_data="claim")]]))
+                    [[ubtn("claim", label="🎫 Cʟᴀɪᴍ Nᴏᴡ")]]))
             sent += 1
         except Exception:  # noqa: BLE001
             pass
@@ -1662,9 +1747,61 @@ async def a_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("👁 Pʀᴇᴠɪᴇᴡ Tᴇxᴛs", callback_data="a_set_preview")],
         [InlineKeyboardButton(f"💎 Pʀᴇᴍɪᴜᴍ Bᴜᴛᴛᴏɴ Iᴄᴏɴs : {'ON' if gi('premium_btn_icons', 1) else 'OFF'}",
                               callback_data="a_t_pbtn")],
+        [InlineKeyboardButton("🎨 Usᴇʀ Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ", callback_data="a_btncfg")],
         [InlineKeyboardButton("🖼 Sᴛᴀʀᴛ Pʜᴏᴛᴏ", callback_data="a_set_photo"),
          InlineKeyboardButton("🗒 Lᴏɢ Cʜᴀɴɴᴇʟ", callback_data="a_set_log")],
         [InlineKeyboardButton("⬅️ Bᴀᴄᴋ", callback_data="a_home")],
+    ])
+    await edit_or_send(update, context, txt, kb)
+
+
+def button_cfg_text(key: str) -> str:
+    default, _ = USER_BUTTONS[key]
+    cfg = user_button_config().get(key, {})
+    label = plain_text(str(cfg.get("label") or default))
+    emoji = str(cfg.get("emoji") or "").strip()
+    style = str(cfg.get("style") or "default").lower()
+    return (f"🔘 <b>{esc(key.replace('_', ' ').title())}</b>\n"
+            f"Text: <code>{esc(label)}</code>\n"
+            f"Emoji: <b>{esc(plain_text(emoji)) if emoji else 'default / none'}</b>\n"
+            f"Style: <b>{esc(style.upper())}</b>")
+
+
+def button_customizer_kb():
+    cfg = user_button_config()
+    kb = []
+    for key, (default, _cb) in USER_BUTTONS.items():
+        style = str(cfg.get(key, {}).get("style") or "default").upper()
+        kb.append([InlineKeyboardButton(
+            f"{plain_text(button_label_from_cfg(key, default))[:27]} • {style}",
+            callback_data=f"a_btncfg_v:{key}")])
+    kb.append([InlineKeyboardButton("♻️ Rᴇsᴇᴛ Aʟʟ", callback_data="a_btncfg_reset")])
+    kb.append([InlineKeyboardButton("⬅️ Bᴀᴄᴋ", callback_data="a_set")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def a_button_customizer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("state", None)
+    txt = (
+        "🎨 <b>Usᴇʀ Bᴜᴛᴛᴏɴ Cᴜsᴛᴏᴍɪᴢᴇʀ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Har user-side button ka text, normal/Premium emoji aur color alag set kijiye.\n\n"
+        "Colors: DEFAULT, PRIMARY (blue), SUCCESS (green), DANGER (red). "
+        "Older Telegram apps styling ignore karke normal button dikhayenge.\n\n"
+        "Button choose kijiye:")
+    await edit_or_send(update, context, txt, button_customizer_kb())
+
+
+async def a_button_customizer_view(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
+    if key not in USER_BUTTONS:
+        return await a_button_customizer(update, context)
+    txt = button_cfg_text(key) + "\n\nEmoji editor me normal ya Premium emoji paste kar sakte hain."
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("😀 Eᴅɪᴛ Eᴍᴏᴊɪ", callback_data=f"a_btncfg_emoji:{key}"),
+         InlineKeyboardButton("✍️ Eᴅɪᴛ Tᴇxᴛ", callback_data=f"a_btncfg_label:{key}")],
+        [InlineKeyboardButton("🎨 Cʏᴄʟᴇ Cᴏʟᴏʀ", callback_data=f"a_btncfg_style:{key}")],
+        [InlineKeyboardButton("♻️ Rᴇsᴇᴛ Tʜɪs Bᴜᴛᴛᴏɴ", callback_data=f"a_btncfg_resetone:{key}")],
+        [InlineKeyboardButton("⬅️ Bᴀᴄᴋ", callback_data="a_btncfg")],
     ])
     await edit_or_send(update, context, txt, kb)
 
@@ -2417,6 +2554,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await a_settings(update, context)
     if data == "a_set_preview":
         return await a_set_preview(update, context)
+    if data == "a_btncfg":
+        return await a_button_customizer(update, context)
+    if data == "a_btncfg_v":
+        return await a_button_customizer_view(update, context, arg)
+    if data in ("a_btncfg_emoji", "a_btncfg_label"):
+        if arg not in USER_BUTTONS:
+            return await a_button_customizer(update, context)
+        context.user_data["target_button"] = arg
+        state = "btn_emoji" if data.endswith("emoji") else "btn_label"
+        prompt = ("😀 <b>Bᴜᴛᴛᴏɴ Eᴍᴏᴊɪ</b>\n\nNormal ya Premium emoji bhejiye. "
+                  "Default par lautne ke liye <code>clear</code>."
+                  if state == "btn_emoji" else
+                  "✍️ <b>Bᴜᴛᴛᴏɴ Tᴇxᴛ</b>\n\nNaya text bhejiye (emoji ke bina). "
+                  "Default par lautne ke liye <code>clear</code>.")
+        context.user_data["state"] = state
+        return await edit_or_send(update, context, prompt, back_kb(f"a_btncfg_v:{arg}"))
+    if data == "a_btncfg_style":
+        if arg in USER_BUTTONS:
+            cfg = user_button_config()
+            item = cfg.setdefault(arg, {})
+            cur = str(item.get("style") or "default").lower()
+            item["style"] = BUTTON_STYLES[(BUTTON_STYLES.index(cur) + 1) % len(BUTTON_STYLES)] if cur in BUTTON_STYLES else "default"
+            save_user_button_config(cfg)
+        return await a_button_customizer_view(update, context, arg)
+    if data == "a_btncfg_resetone":
+        cfg = user_button_config()
+        cfg.pop(arg, None)
+        save_user_button_config(cfg)
+        return await a_button_customizer_view(update, context, arg)
+    if data == "a_btncfg_reset":
+        save_user_button_config({})
+        return await a_button_customizer(update, context)
     if data in ("a_set_refs", "a_set_welcome", "a_set_rwtext", "a_set_gate",
                 "a_set_oos", "a_set_maint", "a_set_photo", "a_set_log"):
         return await ask(update, context, data[2:], "a_set")
@@ -2755,6 +2924,41 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (msg.text or msg.caption or "").strip()          # plain (IDs, numbers, commands)
     rich = html_from_message(msg).strip()                    # HTML + premium emoji preserved
 
+    # ── USER BUTTON CUSTOMIZER ──
+    if state in ("btn_emoji", "btn_label"):
+        key = context.user_data.get("target_button")
+        if key not in USER_BUTTONS:
+            context.user_data.pop("state", None)
+            return await msg.reply_html("❌ Button nahi mila.", reply_markup=back_kb("a_btncfg"))
+        cfg = user_button_config()
+        item = cfg.setdefault(key, {})
+        if state == "btn_emoji":
+            if text.lower() == "clear":
+                item.pop("emoji", None)
+            else:
+                m = TG_EMOJI_RE.search(rich)
+                if m:
+                    item["emoji"] = f'<tg-emoji emoji-id="{m.group(1)}">{m.group(2)}</tg-emoji>'
+                elif text:
+                    item["emoji"] = text[:16]
+                else:
+                    return await msg.reply_html("❌ Emoji bhejiye.")
+        else:
+            if text.lower() == "clear":
+                item.pop("label", None)
+            elif plain_text(rich).strip():
+                item["label"] = plain_text(rich).strip()[:64]
+            else:
+                return await msg.reply_html("❌ Button text bhejiye.")
+        if not item:
+            cfg.pop(key, None)
+        save_user_button_config(cfg)
+        context.user_data.pop("state", None)
+        context.user_data.pop("target_button", None)
+        return await msg.reply_html(
+            "✅ Button customization save ho gayi.\n\n" + button_cfg_text(key),
+            reply_markup=back_kb(f"a_btncfg_v:{key}"))
+
     # ── BROADCAST ──
     if state == "bc_wait":
         context.user_data["bc"] = (msg.chat_id, msg.message_id)
@@ -3069,7 +3273,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for k in ("state", "bc", "bc_button", "restore_file_id", "target", "target_ch", "target_gc"):
+    for k in ("state", "bc", "bc_button", "restore_file_id", "target", "target_ch", "target_gc", "target_button"):
         context.user_data.pop(k, None)
     await update.effective_message.reply_html("❌ Cancel ho gaya.")
 
@@ -3151,7 +3355,7 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Bot use karne ke liye dobara join karke Continue dabaiye 👇",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("✅ Continue", callback_data="verify")]]))
+                        [[ubtn("continue")]]))
             except Exception:  # noqa: BLE001
                 pass
 
