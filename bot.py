@@ -717,10 +717,25 @@ def parse_button_lines(text_html: str):
 
 
 def url_btn_from_cfg(b: dict) -> InlineKeyboardButton:
-    label = b.get("text") or "•"
-    if b.get("icon"):
-        label = f'<tg-emoji emoji-id="{b["icon"]}">{label}</tg-emoji>'
-    return btn(label, url=b.get("url"))
+    """Build a real InlineKeyboardButton directly from a {text,url,icon,style} dict —
+    used for broadcast / reward buttons. Bypasses the button_config registry
+    (that's for the separate Button Customizer feature) so icon/style set on
+    THIS dict always wins."""
+    text = plain_text(b.get("text") or "•").strip()[:64] or "•"
+    kwargs = {"url": b.get("url")}
+    extra = {}
+    icon = b.get("icon")
+    if icon and gi("premium_btn_icons", 1) == 1:
+        extra["icon_custom_emoji_id"] = icon
+    style = str(b.get("style") or "default").lower()
+    if style in BUTTON_STYLES[1:]:
+        extra["style"] = style
+    if not extra:
+        return InlineKeyboardButton(text, **kwargs)
+    try:
+        return InlineKeyboardButton(text, **extra, **kwargs)
+    except TypeError:
+        return InlineKeyboardButton(text, api_kwargs=extra, **kwargs)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1372,6 +1387,26 @@ async def show_top(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fals
                             delete_current=bool(update.callback_query))
 
 
+def gc_validate(g, uid: int):
+    """Gift code claim se pehle saari checks. Return: error HTML string ya None (OK)."""
+    if not g:
+        return "❌ Ye gift code exist nahi karta."
+    if not int(g["active"] or 0):
+        return "⛔ Ye gift code disable kar diya gaya hai."
+    exp = int(g["expires_at"] or 0)
+    if exp and now() > exp:
+        return "⏰ Ye gift code expire ho chuka hai."
+    limit = int(g["max_uses"] or 0)
+    if limit and int(g["used"] or 0) >= limit:
+        return "🚫 Ye gift code apni usage limit tak pahunch chuka hai."
+    already = one("SELECT 1 FROM giftclaims WHERE code=? AND user_id=?", (g["code"], uid))
+    if already:
+        return "❌ Aap ye gift code pehle hi claim kar chuke hain."
+    if not (g["agent_number"] or "").strip():
+        return "❌ Is code par abhi koi reward number set nahi hai. Admin se contact karo."
+    return None
+
+
 async def redeem_gift(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_code: str):
     tg = update.effective_user
     msg = update.effective_message
@@ -1463,6 +1498,7 @@ async def edit_or_send(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: 
 async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=True):
     context.user_data.pop("state", None)
     context.user_data.pop("bc_button", None)
+    context.user_data.pop("bc_button_pending", None)
     total = int(scalar("SELECT COUNT(*) FROM users"))
     txt = (
         "👑 <b>Aᴅᴍɪɴ Cᴏɴᴛʀᴏʟ Pᴀɴᴇʟ</b>\n"
@@ -2083,6 +2119,35 @@ async def a_gc_view(update: Update, context: ContextTypes.DEFAULT_TYPE, code: st
     if not g:
         return await a_giftcodes(update, context)
     await edit_or_send(update, context, gc_card(g), gc_card_kb(g))
+
+
+def gc_get(code: str):
+    return one("SELECT * FROM giftcodes WHERE code=?", ((code or "").strip().upper(),))
+
+
+def gc_generate(prefix: str = None) -> str:
+    """Naya unique random gift code banaye: PREFIX + 6 random alnum chars."""
+    p = (prefix or gs("gc_prefix") or "GIFT").strip().upper()
+    p = re.sub(r"[^A-Z0-9]", "", p) or "GIFT"
+    alphabet = string.ascii_uppercase + string.digits
+    for _ in range(50):
+        code = p + "".join(random.choices(alphabet, k=6))
+        if not gc_get(code):
+            return code
+    # Extremely unlikely fallback: widen with more chars to guarantee uniqueness.
+    return p + "".join(random.choices(alphabet, k=10))
+
+
+def gc_status(g) -> str:
+    if not int(g["active"] or 0):
+        return "⛔ DISABLED"
+    exp = int(g["expires_at"] or 0)
+    if exp and now() > exp:
+        return "⏰ EXPIRED"
+    limit = int(g["max_uses"] or 0)
+    if limit and int(g["used"] or 0) >= limit:
+        return "🚫 USED UP"
+    return "✅ ACTIVE"
 
 
 def gc_create(code: str, admin_id: int):
@@ -2906,8 +2971,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update, context,
             "🔘 <b>Bʀᴏᴀᴅᴄᴀsᴛ Bᴜᴛᴛᴏɴ</b>\n\n"
             "Format: <code>Button Text - https://link</code>\n\n"
-            "Example: <code>🌐 Visit Now - https://example.com</code>\n\n❌ /cancel",
+            "Example: <code>🌐 Visit Now - https://example.com</code>\n\n"
+            "💎 Premium emoji bhi type/paste kar sakte ho, wo icon button pe show hoga.\n\n❌ /cancel",
             back_kb("a_home"))
+    if data.startswith("a_bc_style:"):
+        pending = context.user_data.get("bc_button_pending")
+        if not pending:
+            return await cq.answer("❌ Pehle button text/URL bhejiye.", show_alert=True)
+        style = data.split(":", 1)[1]
+        if style not in BUTTON_STYLES:
+            style = "default"
+        pending["style"] = style
+        context.user_data["bc_button"] = pending
+        context.user_data.pop("bc_button_pending", None)
+        style_label = {"default": "⚪ Default", "primary": "🔵 Primary",
+                       "danger": "🔴 Danger", "success": "🟢 Success"}[style]
+        preview_kb = InlineKeyboardMarkup([[url_btn_from_cfg(pending)],
+                                           [ikb("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
+                                           [ikb("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
+                                           [ikb("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")]])
+        await cq.answer(f"🎨 Style set: {style_label}")
+        return await edit_or_send(
+            update, context,
+            f"✅ Button ready — Style: <b>{style_label}</b>\n\n"
+            "👇 Preview button neeche hai. Ab broadcast karo.",
+            preview_kb)
     if data in ("a_bc_go", "a_bc_pin"):
         bc = context.user_data.get("bc")
         if not bc:
@@ -3123,13 +3211,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         btns, _bad = parse_button_lines(rich)
         if not btns:
             return await msg.reply_html("❌ Valid URL chahiye. Format: <code>Text - https://link</code>")
-        context.user_data["bc_button"] = btns[0]
+        context.user_data["bc_button_pending"] = btns[0]
         context.user_data.pop("state", None)
+        emoji_note = " 💎" if btns[0].get("icon") else ""
         return await msg.reply_html(
-            f"✅ Button set: <b>{esc(btns[0]['text'])}</b> → {esc(btns[0]['url'])}\n\nAb broadcast karo.",
+            f"✅ Button: <b>{esc(btns[0]['text'])}</b>{emoji_note} → {esc(btns[0]['url'])}\n\n"
+            "🎨 Ab button ka <b>color/style</b> chuniye:",
             reply_markup=InlineKeyboardMarkup([
-                [ikb("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
-                [ikb("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
+                [ikb("⚪ Default", callback_data="a_bc_style:default"),
+                 ikb("🔵 Primary", callback_data="a_bc_style:primary")],
+                [ikb("🔴 Danger", callback_data="a_bc_style:danger"),
+                 ikb("🟢 Success", callback_data="a_bc_style:success")],
                 [ikb("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")],
             ]), disable_web_page_preview=True)
 
@@ -3429,7 +3521,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel active input and return to a clean fresh Admin home screen."""
-    for k in ("state", "bc", "bc_button", "restore_file_id", "target", "target_ch",
+    for k in ("state", "bc", "bc_button", "bc_button_pending", "restore_file_id", "target", "target_ch",
               "target_gc", "target_button"):
         context.user_data.pop(k, None)
     try:
