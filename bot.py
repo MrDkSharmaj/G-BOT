@@ -77,6 +77,12 @@ DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 BC_RATE = float(os.getenv("BC_RATE") or "20")        # messages per second (global cap)
 BC_WORKERS = int(os.getenv("BC_WORKERS") or "6")      # parallel senders
 BC_STATUS_EVERY = float(os.getenv("BC_STATUS_EVERY") or "2")   # seconds between live updates
+# Telegram "Paid Broadcast" (allow_paid_broadcast=True) — bypasses the ~30 msg/s
+# soft cap, up to 1000 msg/s, billed in Telegram Stars from the bot's balance.
+# Must be enabled with @BotFather first (Bot Settings → Paid Broadcasts). Rate/workers
+# auto-scale up when the admin turns this ON for a broadcast.
+BC_PAID_RATE = float(os.getenv("BC_PAID_RATE") or "300")     # msg/s when paid mode is ON
+BC_PAID_WORKERS = int(os.getenv("BC_PAID_WORKERS") or "25")  # parallel senders when paid mode is ON
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -638,6 +644,14 @@ def button_parts(key: str, default_label: str):
     base = custom_label or default_label
     emoji_html = str(cfg.get("emoji") or "").strip()
     remove_emoji = bool(cfg.get("remove_emoji"))
+    # Premium emoji embedded directly in the label (e.g. per-channel join-button
+    # text, or any caller-supplied HTML) — used only when there's no separate
+    # admin override for this button's emoji via the Button Customizer.
+    inline_icon = None
+    if not emoji_html and not remove_emoji:
+        m_inline = TG_EMOJI_RE.search(base)
+        if m_inline:
+            inline_icon = m_inline.group(1)
     if emoji_html or remove_emoji:
         base = strip_leading_emoji(base)
     text = plain_text(base).strip() or "•"
@@ -652,6 +666,8 @@ def button_parts(key: str, default_label: str):
     elif emoji_html:
         # Normal emoji replacement: still replace the old icon instead of appending to it.
         fallback = plain_text(emoji_html).strip()
+    elif inline_icon:
+        icon = inline_icon
     if fallback and not icon:
         text = f"{fallback} {text}".strip()
     style = str(cfg.get("style") or "default").lower()
@@ -2202,19 +2218,25 @@ class _Pacer:
 
 
 class BroadcastJob:
-    def __init__(self, admin_id, from_chat, msg_id, status_msg_id, pin=False, reply_markup=None):
+    def __init__(self, admin_id, from_chat, msg_id, status_msg_id, pin=False, reply_markup=None,
+                 paid=False, extra_msg_ids=None):
         self.admin_id = admin_id
         self.from_chat = from_chat
         self.msg_id = msg_id
+        # Agar source ek album/media-group tha to baaki items yahan (copy karne ke liye)
+        self.extra_msg_ids = extra_msg_ids or []
         self.status_msg_id = status_msg_id
         self.pin = pin
         self.reply_markup = reply_markup
+        self.paid = paid                    # Telegram Paid Broadcast (allow_paid_broadcast)
         self.targets = [int(r["user_id"]) for r in rows("SELECT user_id FROM users WHERE blocked=0")]
         self.total = len(self.targets)
         self.sent = 0
         self.failed = 0
         self.blocked = 0
         self.flood_waits = 0
+        self.bad_request_count = 0
+        self.last_error = None              # last non-Forbidden error text (for admin visibility)
         self.cursor = 0                     # agla user index (resume yahin se)
         self.running = asyncio.Event()      # set = chal raha hai, clear = paused
         self.running.set()
@@ -2276,8 +2298,9 @@ class BroadcastJob:
         el = int(self.elapsed())
         speed = (self.processed / el) if el > 0 else 0.0
         eta = int(self.remaining / speed) if speed > 0 and not self.finished else 0
+        paid_tag = " ⭐️<b>PAID</b>" if self.paid else ""
         txt = (
-            f"{head}\n"
+            f"{head}{paid_tag}\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"📤 Sent: <b>{fnum(self.sent)}</b>\n"
             f"⏳ Remaining: <b>{fnum(self.remaining)}</b>\n"
@@ -2291,6 +2314,11 @@ class BroadcastJob:
         )
         if not self.finished and eta:
             txt += f"  •  ⌛ ETA: <b>{eta}s</b>"
+        # Agar sends fail ho rahe hain (blocked ke alawa), reason turant dikhao —
+        # taaki "0 sent" hone par admin ko pata chale WHY, guess na karna pade.
+        if self.bad_request_count and self.last_error:
+            txt += (f"\n\n⚠️ <b>{fnum(self.bad_request_count)} send error(s)</b> — last reason:\n"
+                     f"<code>{esc(self.last_error[:200])}</code>")
         return txt
 
     def controls(self):
@@ -2322,8 +2350,29 @@ async def _bc_send_one(bot, job: BroadcastJob, uid: int) -> bool:
     """Ek user ko bhejo. True = delivered. Flood-wait par wait karke retry."""
     for attempt in range(3):
         try:
-            m = await bot.copy_message(chat_id=uid, from_chat_id=job.from_chat,
-                                       message_id=job.msg_id, reply_markup=job.reply_markup)
+            try:
+                m = await bot.copy_message(chat_id=uid, from_chat_id=job.from_chat,
+                                           message_id=job.msg_id, reply_markup=job.reply_markup,
+                                           allow_paid_broadcast=job.paid)
+            except BadRequest as e:
+                # Agar paid mode BotFather me enable nahi hai to Telegram is param
+                # ko reject karta hai — pehli baar hote hi job-wide flag off karke
+                # fallback normal copy try karo (poore broadcast ko na maro).
+                if job.paid and "paid" in str(e).lower():
+                    job.paid = False
+                    job.last_error = ("Paid broadcast off ho gaya (not enabled in @BotFather) — "
+                                       "normal speed pe switch ho gaya.")
+                    m = await bot.copy_message(chat_id=uid, from_chat_id=job.from_chat,
+                                               message_id=job.msg_id, reply_markup=job.reply_markup)
+                else:
+                    raise
+            # Album ke baaki items (agar hain) — sirf pehle item par button/pin apply hota hai
+            for extra_id in job.extra_msg_ids:
+                try:
+                    await bot.copy_message(chat_id=uid, from_chat_id=job.from_chat,
+                                           message_id=extra_id, allow_paid_broadcast=job.paid)
+                except Exception:  # noqa: BLE001
+                    pass   # ek album item fail ho to poora send fail mat karo
             if job.pin:
                 try:
                     await bot.pin_chat_message(uid, m.message_id, disable_notification=True)
@@ -2341,10 +2390,17 @@ async def _bc_send_one(bot, job: BroadcastJob, uid: int) -> bool:
             job.blocked += 1
             q("UPDATE users SET blocked=1 WHERE user_id=?", (uid,))
             return False
-        except BadRequest:
-            return False           # chat not found / deactivated etc.
+        except BadRequest as e:
+            # chat not found / deactivated / OR the source message itself can't be
+            # copied (protected content, service message, expired album item etc.)
+            # Record the reason so the admin can actually see why sends are failing,
+            # instead of the job silently finishing at 0 sent.
+            job.last_error = str(e)
+            job.bad_request_count += 1
+            return False
         except Exception as e:  # noqa: BLE001
             log.warning("bc send fail %s: %s", uid, e)
+            job.last_error = str(e)
             return False
     return False
 
@@ -2397,10 +2453,12 @@ async def refresh_bc_status(bot, job: BroadcastJob):
 async def run_broadcast(context: ContextTypes.DEFAULT_TYPE, job: BroadcastJob):
     bot = context.bot
     BC_JOBS[job.admin_id] = job
-    pacer = _Pacer(BC_RATE)
+    rate = BC_PAID_RATE if job.paid else BC_RATE
+    worker_cap = BC_PAID_WORKERS if job.paid else BC_WORKERS
+    pacer = _Pacer(rate)
     status_task = asyncio.create_task(_bc_status_loop(bot, job))
     workers = [asyncio.create_task(_bc_worker(bot, job, pacer))
-               for _ in range(max(1, min(BC_WORKERS, max(1, job.total))))]
+               for _ in range(max(1, min(worker_cap, max(1, job.total))))]
     try:
         await asyncio.gather(*workers, return_exceptions=True)
     finally:
@@ -2421,14 +2479,20 @@ async def a_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await edit_or_send(update, context,
                                   job.status_text() + "\n\n<i>Ek broadcast already chal raha hai — "
                                   "pehle use complete/stop kijiye.</i>", job.controls())
+    context.user_data.pop("bc_paid", None)
+    context.user_data.pop("bc_album", None)
+    context.user_data.pop("bc_extra", None)
     context.user_data["state"] = "bc_wait"
     txt = (
         "📣 <b>Bʀᴏᴀᴅᴄᴀsᴛ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "Jo message sabko bhejna hai wo <b>abhi bhej dijiye</b> — text, photo, video, "
-        "document, sticker, premium emoji, buttons wala forward — sab support hai.\n\n"
-        "Bhejne ke baad confirm button aayega.\n\n"
-        f"⚙️ Speed : <b>{BC_RATE:.0f} msg/s</b> • Workers : <b>{BC_WORKERS}</b>\n"
+        "document, sticker, premium emoji, buttons wala forward, ya <b>poora album</b> — "
+        "sab support hai.\n\n"
+        "Bhejne ke baad confirm button aayega — ⭐️ Paid Broadcast toggle bhi wahin milega "
+        "(agar @BotFather se enable kiya hai to ~1000 msg/s tak speed).\n\n"
+        f"⚙️ Normal Speed : <b>{BC_RATE:.0f} msg/s</b> • Workers : <b>{BC_WORKERS}</b>\n"
+        f"⭐️ Paid Speed : <b>{BC_PAID_RATE:.0f} msg/s</b> • Workers : <b>{BC_PAID_WORKERS}</b>\n"
         "⏸ Pause / ▶️ Resume / ⏹ Stop — live status message par milenge.\n\n"
         "❌ Cancel ke liye /cancel"
     )
@@ -2974,19 +3038,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: <code>🌐 Visit Now - https://example.com</code>\n\n"
             "💎 Premium emoji bhi type/paste kar sakte ho, wo icon button pe show hoga.\n\n❌ /cancel",
             back_kb("a_home"))
-    if data.startswith("a_bc_style:"):
+    if data == "a_bc_style":
         pending = context.user_data.get("bc_button_pending")
         if not pending:
             return await cq.answer("❌ Pehle button text/URL bhejiye.", show_alert=True)
-        style = data.split(":", 1)[1]
-        if style not in BUTTON_STYLES:
-            style = "default"
+        style = arg if arg in BUTTON_STYLES else "default"
         pending["style"] = style
         context.user_data["bc_button"] = pending
         context.user_data.pop("bc_button_pending", None)
         style_label = {"default": "⚪ Default", "primary": "🔵 Primary",
                        "danger": "🔴 Danger", "success": "🟢 Success"}[style]
+        paid_on = bool(context.user_data.get("bc_paid"))
         preview_kb = InlineKeyboardMarkup([[url_btn_from_cfg(pending)],
+                                           [ikb("⭐️ Pᴀɪᴅ Bʀᴏᴀᴅᴄᴀsᴛ ᴏꜰꜰ" if paid_on else "⭐️ Pᴀɪᴅ Bʀᴏᴀᴅᴄᴀsᴛ ᴏɴ",
+                                                callback_data="a_bc_paid_off" if paid_on else "a_bc_paid_on")],
                                            [ikb("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
                                            [ikb("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
                                            [ikb("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")]])
@@ -2996,6 +3061,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Button ready — Style: <b>{style_label}</b>\n\n"
             "👇 Preview button neeche hai. Ab broadcast karo.",
             preview_kb)
+    if data in ("a_bc_paid_on", "a_bc_paid_off"):
+        if not context.user_data.get("bc"):
+            return await cq.answer("❌ Pehle broadcast message bhejiye.", show_alert=True)
+        turn_on = (data == "a_bc_paid_on")
+        context.user_data["bc_paid"] = turn_on
+        # Rebuild the confirm keyboard with the toggle flipped
+        bc_btn = context.user_data.get("bc_button")
+        rows_kb = [[ikb("🔘 Aᴅᴅ Bᴜᴛᴛᴏɴ", callback_data="a_bc_addbtn")]]
+        if bc_btn:
+            rows_kb = [[url_btn_from_cfg(bc_btn)], rows_kb[0]]
+        rows_kb.append(
+            [ikb("⭐️ Pᴀɪᴅ Bʀᴏᴀᴅᴄᴀsᴛ ᴏɴ" if not turn_on else "⭐️ Pᴀɪᴅ Bʀᴏᴀᴅᴄᴀsᴛ ᴏꜰꜰ",
+                 callback_data="a_bc_paid_off" if turn_on else "a_bc_paid_on")])
+        rows_kb += [[ikb("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
+                    [ikb("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
+                    [ikb("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")]]
+        await cq.answer(
+            "⭐️ Paid Broadcast ON — up to 1000/s, Stars se billed hoga."
+            if turn_on else "Paid Broadcast OFF — normal speed.", show_alert=turn_on)
+        return await edit_or_send(
+            update, context,
+            "📣 <b>Cᴏɴғɪʀᴍ Bʀᴏᴀᴅᴄᴀsᴛ</b>\n\n"
+            + ("⭐️ <b>Paid mode ON</b> — Telegram Stars se billed hoga, ~1000 msg/s speed."
+               if turn_on else "Normal speed se bhejega (paid mode off)."),
+            InlineKeyboardMarkup(rows_kb))
     if data in ("a_bc_go", "a_bc_pin"):
         bc = context.user_data.get("bc")
         if not bc:
@@ -3005,12 +3095,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await cq.answer("⚠️ Ek broadcast already chal raha hai.", show_alert=True)
         context.user_data.pop("state", None)
         context.user_data.pop("bc", None)
+        extra_ids = context.user_data.pop("bc_extra", None) or []
+        paid = bool(context.user_data.pop("bc_paid", False))
         bc_btn = context.user_data.pop("bc_button", None)
         markup = None
         if bc_btn:
             markup = InlineKeyboardMarkup([[url_btn_from_cfg(bc_btn)]])
         job = BroadcastJob(uid, bc[0], bc[1], cq.message.message_id,
-                           pin=(data == "a_bc_pin"), reply_markup=markup)
+                           pin=(data == "a_bc_pin"), reply_markup=markup,
+                           paid=paid, extra_msg_ids=extra_ids)
         try:
             await cq.edit_message_text(job.status_text(), parse_mode=ParseMode.HTML,
                                        reply_markup=job.controls())
@@ -3193,7 +3286,57 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── BROADCAST ──
     if state == "bc_wait":
+        gid = msg.media_group_id
+        if gid:
+            # Forwarded/sent post is an ALBUM — Telegram delivers it as several separate
+            # updates (one per photo/video), all sharing this media_group_id. Only
+            # copy_message'ing the first item silently drops the rest, which is why a
+            # forwarded album looked like "nothing happened". Collect every item that
+            # belongs to the same album and debounce the confirm screen to fire once,
+            # after Telegram has finished delivering the group (~1s gap is enough).
+            pending = context.user_data.get("bc_album")
+            if not pending or pending.get("gid") != gid:
+                pending = {"gid": gid, "chat_id": msg.chat_id, "first_id": msg.message_id, "ids": []}
+                context.user_data["bc_album"] = pending
+            pending["ids"].append(msg.message_id)
+            context.user_data["bc_album_seq"] = context.user_data.get("bc_album_seq", 0) + 1
+            seq = context.user_data["bc_album_seq"]
+
+            async def _finalize_album(ctx: ContextTypes.DEFAULT_TYPE):
+                await asyncio.sleep(1.2)
+                if ctx.user_data.get("bc_album_seq") != seq or ctx.user_data.get("state") != "bc_wait":
+                    return   # ek aur item aaya beech me, ya state badal gaya — ye stale hai
+                alb = ctx.user_data.get("bc_album")
+                if not alb:
+                    return
+                ids = sorted(set(alb["ids"]))
+                first, extra = ids[0], ids[1:]
+                ctx.user_data["bc"] = (alb["chat_id"], first)
+                ctx.user_data["bc_extra"] = extra
+                ctx.user_data.pop("bc_album", None)
+                ctx.user_data.pop("bc_button", None)
+                total = int(scalar("SELECT COUNT(*) FROM users WHERE blocked=0"))
+                note = f"\n\n📎 Album detected — <b>{fnum(len(ids))}</b> items sab bhejenge." if len(ids) > 1 else ""
+                await ctx.bot.send_message(
+                    msg.chat_id,
+                    f"📣 <b>Cᴏɴғɪʀᴍ Bʀᴏᴀᴅᴄᴀsᴛ</b>\n\nYe message <b>{fnum(total)}</b> users ko jayega.{note}\n"
+                    "Chaho to pehle ek URL button add kar sakte ho.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [ikb("🔘 Aᴅᴅ Bᴜᴛᴛᴏɴ", callback_data="a_bc_addbtn")],
+                        [ikb("⭐️ Pᴀɪᴅ Bʀᴏᴀᴅᴄᴀsᴛ ᴏꜰꜰ", callback_data="a_bc_paid_off")],
+                        [ikb("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
+                        [ikb("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
+                        [ikb("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")],
+                    ]))
+
+            context.application.create_task(_finalize_album(context))
+            return
+
+        # Normal (non-album) source message.
+        context.user_data.pop("bc_album", None)
         context.user_data["bc"] = (msg.chat_id, msg.message_id)
+        context.user_data["bc_extra"] = []
         total = int(scalar("SELECT COUNT(*) FROM users WHERE blocked=0"))
         context.user_data.pop("bc_button", None)
         return await msg.reply_html(
@@ -3201,6 +3344,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Chaho to pehle ek URL button add kar sakte ho.",
             reply_markup=InlineKeyboardMarkup([
                 [ikb("🔘 Aᴅᴅ Bᴜᴛᴛᴏɴ", callback_data="a_bc_addbtn")],
+                [ikb("⭐️ Pᴀɪᴅ Bʀᴏᴀᴅᴄᴀsᴛ ᴏꜰꜰ", callback_data="a_bc_paid_off")],
                 [ikb("🚀 Sᴇɴᴅ Nᴏᴡ", callback_data="a_bc_go")],
                 [ikb("📌 Sᴇɴᴅ + Pɪɴ", callback_data="a_bc_pin")],
                 [ikb("❌ Cᴀɴᴄᴇʟ", callback_data="a_home")],
