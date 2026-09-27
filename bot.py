@@ -154,7 +154,17 @@ DEFAULT_SETTINGS = {
         "Shuru karo 👇 | <i>By {dev}</i>"
     ),
     "reward_text": (
-        "🎉 <b>Cᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴs {name}!</b> 🎉"
+        "🎉 <b>Cᴏɴɢʀᴀᴛᴜʟᴀᴛɪᴏɴs {name}!</b> 🎉\n\n"
+        "✅ <b>This is your Google Map Rating Agent Number:</b>\n\n"
+        "┌─────────────────────────┐\n"
+        "│  📱  <code>{code}</code>\n"
+        "└─────────────────────────┘\n\n"
+        "📋 Type : <b>{reward_kind}</b>\n"
+        "👥 Referrals : <b>{refs}</b>\n"
+        "🔢 Total Claimed : <b>{claims}</b>\n\n"
+        "📲 Ye number WhatsApp pe available hai.\n"
+        "Contact karo aur apna <b>Google Map Rating task</b> lo!\n\n"
+        "{next_status}"
     ),
     "reward_buttons": "[]",
     "refer_text": (
@@ -1276,21 +1286,14 @@ async def do_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u2 = get_user(tg.id)
     can2, need2, _ = claim_state(u2)
     code = str(r["code"])
-    body = render(gs("reward_text"), u2, tg)
-    txt = (
-        f"{body}\n\n"
-        f"✅ <b>This is your Google Map Rating Agent Number:</b>\n\n"
-        f"┌─────────────────────────┐\n"
-        f"│  📱  <code>{esc(code)}</code>\n"
-        f"└─────────────────────────┘\n\n"
-        f"📋 Type : <b>{'Free Bonus' if kind == 'bonus' else 'Agent Number Reward'}</b>\n"
-        f"👥 Referrals : <b>{int(u2['refs'] or 0)}</b>\n"
-        f"🔢 Total Claimed : <b>{int(u2['claims'] or 0)}</b>\n\n"
-        f"📲 Ye number WhatsApp pe available hai.\n"
-        f"Contact karo aur apna <b>Google Map Rating task</b> lo!\n\n"
-    )
-    txt += ("✅ <b>Agla number bhi ready hai — dobara Claim dabao!</b>"
-            if can2 else f"👥 Next number ke liye <b>{need2}</b> referral chahiye.")
+    next_status = ("✅ <b>Agla number bhi ready hai — dobara Claim dabao!</b>"
+                   if can2 else f"👥 Next number ke liye <b>{need2}</b> referral chahiye.")
+    extra = {
+        "code": esc(code),
+        "reward_kind": "Free Bonus" if kind == "bonus" else "Agent Number Reward",
+        "next_status": next_status,
+    }
+    txt = render(gs("reward_text"), u2, tg, extra=extra)
     reward_kb = reward_buttons_kb(code)
 
     if cq:
@@ -1550,7 +1553,7 @@ async def a_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [ikb("➕ Aᴅᴅ Aɢᴇɴᴛ Nᴜᴍʙᴇʀs", callback_data="a_rw_add")],
         [ikb("📋 Lɪsᴛ / Dᴇʟᴇᴛᴇ", callback_data="a_rw_list")],
         [ikb("🔘 Rᴇᴡᴀʀᴅ Bᴜᴛᴛᴏɴs", callback_data="a_rw_btn"),
-         ikb("✍️ Rᴇᴡᴀʀᴅ Tᴇxᴛ", callback_data="a_set_rwtext")],
+         ikb("✍️ Fᴜʟʟ Rᴇᴡᴀʀᴅ Mᴇssᴀɢᴇ", callback_data="a_set_rwtext")],
         [ikb(f"🎛 Mᴏᴅᴇ : {mode.upper()}", callback_data="a_rw_mode")],
         [ikb("🧹 Cʟᴇᴀʀ Usᴇᴅ", callback_data="a_rw_clrused"),
          ikb("🗑 Cʟᴇᴀʀ Aʟʟ", callback_data="a_rw_clrall")],
@@ -1890,7 +1893,7 @@ async def a_set_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg = update.effective_user
     u = get_user(tg.id)
     await update.callback_query.answer("👁 Preview bhej raha hoon…")
-    for label, key in (("Welcome", "welcome_text"), ("Reward", "reward_text"),
+    for label, key in (("Welcome", "welcome_text"),
                        ("Gate", "gate_text"), ("Out-of-Stock", "outofstock_text"),
                        ("Maintenance", "maintenance_text")):
         try:
@@ -1900,6 +1903,20 @@ async def a_set_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:  # noqa: BLE001
             await context.bot.send_message(tg.id, f"⚠️ {label} text render fail: {esc(e)}",
                                            parse_mode=ParseMode.HTML)
+    # Reward message (needs sample extra placeholders)
+    try:
+        can_r, need_r, _ = claim_state(u) if u else (False, 0, "")
+        sample_next = ("✅ <b>Agla number bhi ready hai — dobara Claim dabao!</b>"
+                       if can_r else f"👥 Next number ke liye <b>{need_r}</b> referral chahiye.")
+        rw_extra = {"code": "9876543210", "reward_kind": "Agent Number Reward",
+                    "next_status": sample_next}
+        rw_preview = render(gs("reward_text"), u, tg, extra=rw_extra)
+        await context.bot.send_message(
+            tg.id, "👁 <b>Reward Text Preview</b>\n━━━━━━━━━━━━━━━━━━\n" + rw_preview,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:  # noqa: BLE001
+        await context.bot.send_message(tg.id, f"⚠️ Reward text render fail: {esc(e)}",
+                                       parse_mode=ParseMode.HTML)
     # Refer & Earn (needs extra placeholders)
     try:
         link = ref_link(tg.id)
@@ -2445,8 +2462,11 @@ ASK_TEXT = {
                  "ya <code>3</code>).\nMatlab: itne referral = 1 Agent Number.\n\n❌ /cancel"),
     "set_welcome": ("✍️ <b>Wᴇʟᴄᴏᴍᴇ Tᴇxᴛ</b>\n\nNaya text bhejiye.\nVariables: {name} {per} {refs} "
                     "{claims} {stock} {next} {dev}" + PREMIUM_NOTE + "\n\n❌ /cancel"),
-    "set_rwtext": ("✍️ <b>Rᴇᴡᴀʀᴅ Mᴇssᴀɢᴇ Tᴇxᴛ</b>\n\nReward ke sath jo message jayega wo "
-                   "bhejiye.\nVariables: {name} {refs} {claims} {dev}" + PREMIUM_NOTE + "\n\n❌ /cancel"),
+    "set_rwtext": ("✍️ <b>Fᴜʟʟ Rᴇᴡᴀʀᴅ Mᴇssᴀɢᴇ</b>\n\nJab user Agent Number claim karta hai to "
+                   "poora message (number, type, stats sab) yahi text se banta hai. Naya text "
+                   "bhejiye.\nVariables: {name} {refs} {claims} {dev}\n"
+                   "Extra (isi message ke liye): {code} {reward_kind} {next_status}"
+                   + PREMIUM_NOTE + "\n\n❌ /cancel"),
     "set_refer": ("👥 <b>Rᴇғᴇʀ & Eᴀʀɴ Tᴇxᴛ</b>\n\nRefer & Earn screen ka message bhejiye.\n"
                   "Variables: {name} {per} {refs} {claims} {stock} {next} {dev}\n"
                   "Extra: {link} {invited} {verified} {status}"
